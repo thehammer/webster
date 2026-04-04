@@ -1,0 +1,21 @@
+{
+  "name": "webster",
+  "version": "0.1.0",
+  "description": "Browser automation MCP server for Claude Code",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "bun src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/bun": "latest"
+  },
+  "keywords": ["mcp", "browser-automation", "claude", "claude-code"],
+  "license": "MIT"
+}
