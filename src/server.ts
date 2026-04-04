@@ -39,12 +39,12 @@ export class WebsterServer {
     return this.server.port as number
   }
 
-  private handleOpen(ws: unknown) {
-    this.extension = ws
-    console.error('Extension connected')
+  private handleOpen(_ws: unknown) {
+    // Don't track yet — wait for the { type: 'connected' } handshake message.
+    // This prevents test clients or stray connections from hijacking the slot.
   }
 
-  private handleMessage(_ws: unknown, data: string | Buffer) {
+  private handleMessage(ws: unknown, data: string | Buffer) {
     let msg: WsMessage
     try {
       msg = JSON.parse(typeof data === 'string' ? data : data.toString())
@@ -54,7 +54,12 @@ export class WebsterServer {
     }
 
     if (!isResult(msg)) {
-      // It's a WsEvent (e.g. connected handshake) — just log it
+      // It's a WsEvent — the extension identifying itself
+      if (this.extension && this.extension !== ws) {
+        // Close the previously tracked connection cleanly
+        try { (this.extension as { close(): void }).close() } catch { /* ignore */ }
+      }
+      this.extension = ws
       console.error(`Webster: extension v${msg.version} connected`)
       return
     }

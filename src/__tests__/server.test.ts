@@ -21,6 +21,14 @@ async function connectExtension(port: number): Promise<WebSocket> {
   return ws
 }
 
+// Connect and send the required handshake so the server tracks this WS as the extension
+async function connectAndHandshake(port: number): Promise<WebSocket> {
+  const ws = await connectExtension(port)
+  ws.send(JSON.stringify({ type: 'connected', version: '0.1.0' }))
+  await new Promise(r => setTimeout(r, 20))
+  return ws
+}
+
 describe('WebsterServer', () => {
   let server: WebsterServer
   let port: number
@@ -44,15 +52,13 @@ describe('WebsterServer', () => {
   })
 
   test('isConnected() returns true after extension connects', async () => {
-    const ws = await connectExtension(port)
-    // Give server a moment to register the connection
-    await new Promise(r => setTimeout(r, 20))
+    const ws = await connectAndHandshake(port)
     expect(server.isConnected()).toBe(true)
     ws.close()
   })
 
   test('isConnected() returns false after extension disconnects', async () => {
-    const ws = await connectExtension(port)
+    const ws = await connectAndHandshake(port)
     await new Promise(r => setTimeout(r, 20))
     expect(server.isConnected()).toBe(true)
 
@@ -62,7 +68,7 @@ describe('WebsterServer', () => {
   })
 
   test('dispatch resolves with result data when extension sends matching id back', async () => {
-    const ws = await connectExtension(port)
+    const ws = await connectAndHandshake(port)
     await new Promise(r => setTimeout(r, 20))
 
     // Echo back a successful result
@@ -78,7 +84,7 @@ describe('WebsterServer', () => {
   })
 
   test('dispatch rejects with error message when extension sends success: false', async () => {
-    const ws = await connectExtension(port)
+    const ws = await connectAndHandshake(port)
     await new Promise(r => setTimeout(r, 20))
 
     ws.onmessage = (event) => {
@@ -93,7 +99,7 @@ describe('WebsterServer', () => {
   })
 
   test('dispatch times out when extension does not respond', async () => {
-    const ws = await connectExtension(port)
+    const ws = await connectAndHandshake(port)
     await new Promise(r => setTimeout(r, 20))
 
     // Don't respond to the command
@@ -106,7 +112,7 @@ describe('WebsterServer', () => {
   }, 2000)
 
   test('pending commands are rejected when extension disconnects mid-flight', async () => {
-    const ws = await connectExtension(port)
+    const ws = await connectAndHandshake(port)
     await new Promise(r => setTimeout(r, 20))
 
     // Don't respond, just close
@@ -119,7 +125,7 @@ describe('WebsterServer', () => {
   }, 2000)
 
   test('{ type: "connected" } message from extension is handled without error', async () => {
-    const ws = await connectExtension(port)
+    const ws = await connectAndHandshake(port)
     await new Promise(r => setTimeout(r, 20))
 
     // Send the connected handshake event

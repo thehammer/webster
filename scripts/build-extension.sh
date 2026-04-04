@@ -55,11 +55,18 @@ build_safari() {
   # Safari MV3 does not support ES module service workers ("type": "module").
   # Concatenate all background JS into a single non-module file, stripping
   # import/export statements so it runs in classic (non-module) context.
-  cat \
-    "$OUT/background/command-handlers.js" \
-    "$OUT/background/service-worker.js" \
-    | sed 's/^export \(function\|const\|class\|async\)/\1/g; /^import .*/d; /^export {/d' \
-    > "$OUT/background/_bundled.js"
+  cat "$OUT/background/command-handlers.js" "$OUT/background/service-worker.js" \
+  | python3 -c "
+import sys, re
+content = sys.stdin.read()
+# Remove import statements
+content = re.sub(r'^import\s+.*$', '', content, flags=re.MULTILINE)
+# Remove export keyword from function/const/class/async declarations
+content = re.sub(r'^export\s+((?:async\s+)?(?:function|const|let|var|class))', r'\1', content, flags=re.MULTILINE)
+# Remove bare export { ... } blocks
+content = re.sub(r'^export\s*\{[^}]*\}.*$', '', content, flags=re.MULTILINE)
+sys.stdout.write(content)
+" > "$OUT/background/_bundled.js"
   rm "$OUT/background/command-handlers.js" "$OUT/background/service-worker.js"
   mv "$OUT/background/_bundled.js" "$OUT/background/service-worker.js"
 
@@ -89,15 +96,19 @@ with open('$OUT/manifest.json', 'w') as f:
       --bundle-identifier com.hammer.webster \
       --swift --no-open --macos-only 2>&1
 
-    echo "  Building Xcode project..."
-    cd "$XCODE_OUT/Webster" && xcodebuild \
-      -scheme "Webster" \
-      -configuration Debug \
-      build \
-      CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO 2>&1 | tail -5
-    cd "$ROOT"
-    echo "  Xcode project: $XCODE_OUT"
-    echo "  Enable in Safari > Settings > Extensions"
+    # Fix bundle ID capitalization mismatch (converter uses capital W for app)
+    sed -i '' \
+      's/PRODUCT_BUNDLE_IDENTIFIER = com\.hammer\.Webster;/PRODUCT_BUNDLE_IDENTIFIER = com.hammer.webster;/g' \
+      "$XCODE_OUT/Webster/Webster.xcodeproj/project.pbxproj"
+
+    echo "  Opening Xcode project..."
+    open "$XCODE_OUT/Webster/Webster.xcodeproj"
+    echo ""
+    echo "  Xcode is opening. To install:"
+    echo "    1. Press Cmd+R to build and run"
+    echo "    2. Open Safari > Settings > Extensions"
+    echo "    3. Enable 'Webster'"
+    echo "    4. Safari > Develop > Allow Unsigned Extensions (if prompted)"
   else
     echo "  Run with --xcode to also build the Safari app (requires macOS + Xcode)"
   fi
@@ -135,8 +146,8 @@ if [ ${#TARGETS[@]} -eq 0 ]; then
   TARGETS=(chrome firefox safari)
 fi
 
-# Deduplicate
-mapfile -t TARGETS < <(printf '%s\n' "${TARGETS[@]}" | sort -u)
+# Deduplicate (bash 3.2 compatible)
+IFS=$'\n' read -r -d '' -a TARGETS < <(printf '%s\n' "${TARGETS[@]}" | sort -u && printf '\0') || true
 
 mkdir -p "$BUILD"
 for target in "${TARGETS[@]}"; do

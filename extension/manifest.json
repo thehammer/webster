@@ -15,7 +15,6 @@
 
   "host_permissions": [
     "<all_urls>",
-    "ws://localhost/*",
     "http://localhost/*"
   ],
 
