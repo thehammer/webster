@@ -17,5 +17,13 @@
     "@types/bun": "latest"
   },
   "keywords": ["mcp", "browser-automation", "claude", "claude-code"],
-  "license": "MIT"
+  "license": "MIT",
+  "bin": {
+    "webster": "src/index.ts"
+  },
+  "files": [
+    "src/",
+    "extension/",
+    "scripts/"
+  ]
 }
