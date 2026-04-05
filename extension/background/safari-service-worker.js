@@ -58,6 +58,15 @@ function scheduleReconnect(port) {
 }
 
 async function connect() {
+  // Request Web Lock FIRST — before any awaits — so Safari doesn't suspend the SW
+  // mid-connect. The lock is held until pollLoop's finally block calls lockRelease().
+  if (lockRelease) { lockRelease(); lockRelease = null }
+  if (typeof navigator !== 'undefined' && navigator.locks) {
+    navigator.locks.request('webster-http-poll', { mode: 'shared' }, () =>
+      new Promise((resolve) => { lockRelease = resolve })
+    )
+  }
+
   const port = await getPort()
   const base = `http://localhost:${port}`
 
@@ -74,18 +83,10 @@ async function connect() {
     reconnectDelay = 1000
     await updateState({ connected: true, port, lastError: null })
   } catch (err) {
+    if (lockRelease) { lockRelease(); lockRelease = null }
     await updateState({ connected: false, lastError: String(err) })
     scheduleReconnect(port)
     return
-  }
-
-  // Hold a Web Lock for the life of the connection so Safari doesn't suspend the SW.
-  // The lock is released when polling stops (lockRelease is called in pollLoop's finally block).
-  const hasLocks = typeof navigator !== 'undefined' && !!navigator.locks
-  if (hasLocks) {
-    navigator.locks.request('webster-http-poll', { mode: 'shared' }, () =>
-      new Promise((resolve) => { lockRelease = resolve })
-    )
   }
 
   // Start polling loop (runs until disconnect)
