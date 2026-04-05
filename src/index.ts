@@ -34,7 +34,7 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     const result = await tool.execute((request.params.arguments ?? {}) as Record<string, unknown>)
     return {
-      content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) }]
+      content: [{ type: 'text', text: result == null ? 'ok' : typeof result === 'string' ? result : JSON.stringify(result, null, 2) }]
     }
   } catch (err) {
     return {
