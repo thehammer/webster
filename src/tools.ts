@@ -295,5 +295,25 @@ export function createTools(server: WebsterServer): WebsterTool[] {
       },
       execute: (input) => dispatch('getAttribute', input),
     },
+
+    {
+      name: 'get_browsers',
+      description: 'List all connected browser extensions. Use this to see which browsers are available before using set_browser.',
+      inputSchema: { type: 'object', properties: {} },
+      execute: () => Promise.resolve(server.getBrowsers()),
+    },
+
+    {
+      name: 'set_browser',
+      description: 'Set the active browser target for all subsequent commands. Use get_browsers first to see available options.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          browser: { type: 'string', description: 'Browser name ("chrome", "safari", "firefox", "edge") or extension id' },
+        },
+        required: ['browser'],
+      },
+      execute: (input) => Promise.resolve(server.setBrowser(input.browser as string)),
+    },
   ]
 }

@@ -56,6 +56,12 @@ m['browser_specific_settings'] = {
         'strict_min_version': '109.0'
     }
 }
+# Firefox enforces host_permissions for WebSocket — add ws://localhost/*
+if 'ws://localhost/*' not in m.get('host_permissions', []):
+    m.setdefault('host_permissions', []).append('ws://localhost/*')
+# Explicit CSP so Firefox HTTPS-Only mode doesn't upgrade ws:// → wss://
+csp = \"script-src 'self'; object-src 'self'; connect-src ws://localhost:*\"
+m['content_security_policy'] = {'extension_pages': csp}
 with open('$OUT/manifest.json', 'w') as f:
     json.dump(m, f, indent=2)
 "

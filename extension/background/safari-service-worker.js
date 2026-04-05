@@ -12,6 +12,8 @@ const KEEPALIVE_INTERVAL_MINUTES = 0.4 // ~24s, well under Safari's ~30s suspend
 let reconnectDelay = 1000
 let reconnectTimer = null
 let polling = false
+let extensionId = null // assigned by server on connect
+let lockRelease = null // releases the Web Lock when polling stops
 
 // Guard against browsers where webRequest isn't available (some Safari versions)
 try {
@@ -60,15 +62,30 @@ async function connect() {
   const base = `http://localhost:${port}`
 
   try {
-    const resp = await fetch(`${base}/connect`, { method: 'POST', signal: AbortSignal.timeout(5000) })
+    const resp = await fetch(`${base}/connect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ browser: 'safari', version: chrome.runtime.getManifest().version }),
+      signal: AbortSignal.timeout(5000)
+    })
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const data = await resp.json()
+    extensionId = data.id
     reconnectDelay = 1000
-    console.log('[webster] Connected to MCP server (HTTP)')
     await updateState({ connected: true, port, lastError: null })
   } catch (err) {
     await updateState({ connected: false, lastError: String(err) })
     scheduleReconnect(port)
     return
+  }
+
+  // Hold a Web Lock for the life of the connection so Safari doesn't suspend the SW.
+  // The lock is released when polling stops (lockRelease is called in pollLoop's finally block).
+  const hasLocks = typeof navigator !== 'undefined' && !!navigator.locks
+  if (hasLocks) {
+    navigator.locks.request('webster-http-poll', { mode: 'shared' }, () =>
+      new Promise((resolve) => { lockRelease = resolve })
+    )
   }
 
   // Start polling loop (runs until disconnect)
@@ -81,7 +98,7 @@ async function pollLoop(port, base) {
     while (true) {
       let command
       try {
-        const resp = await fetch(`${base}/poll`, { signal: AbortSignal.timeout(28000) })
+        const resp = await fetch(`${base}/poll?id=${extensionId}`, { signal: AbortSignal.timeout(28000) })
         if (!resp.ok) throw new Error(`Poll HTTP ${resp.status}`)
         command = await resp.json()
       } catch (err) {
@@ -114,6 +131,7 @@ async function pollLoop(port, base) {
     }
   } finally {
     polling = false
+    if (lockRelease) { lockRelease(); lockRelease = null }
   }
 }
 
@@ -133,7 +151,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       reconnectDelay = 1000
       // Disconnect from the server before reconnecting on the new port
       getPort().then((oldPort) => {
-        fetch(`http://localhost:${oldPort}/connect`, { method: 'DELETE' }).catch(() => {})
+        fetch(`http://localhost:${oldPort}/connect?id=${extensionId}`, { method: 'DELETE' }).catch(() => {})
       })
       connect()
       sendResponse({ ok: true })

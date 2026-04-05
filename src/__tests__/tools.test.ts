@@ -5,6 +5,8 @@ import type { WebsterServer } from '../server.js'
 const mockServer = {
   dispatch: async (_cmd: Record<string, unknown>) => ({ success: true }),
   isConnected: () => true,
+  getBrowsers: () => [],
+  setBrowser: (_idOrName: string) => ({ id: 'test', browser: 'chrome', version: '1.0', transport: 'ws', active: true }),
 } as unknown as WebsterServer
 
 const tools = createTools(mockServer)
@@ -32,15 +34,17 @@ const EXPECTED_TOOL_NAMES = [
   'find',
   'scroll_to',
   'get_attribute',
+  'get_browsers',
+  'set_browser',
 ]
 
 describe('createTools', () => {
-  test('all 22 tools are present by name', () => {
+  test('all 24 tools are present by name', () => {
     const names = tools.map(t => t.name)
     for (const expected of EXPECTED_TOOL_NAMES) {
       expect(names).toContain(expected)
     }
-    expect(tools).toHaveLength(22)
+    expect(tools).toHaveLength(24)
   })
 
   test('all tools have description and inputSchema', () => {

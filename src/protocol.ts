@@ -14,6 +14,7 @@ export interface WsResult {
 export interface WsEvent {
   type: 'connected'
   version: string
+  browser?: string
 }
 
 export type WsMessage = WsResult | WsEvent

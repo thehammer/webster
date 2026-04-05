@@ -10,6 +10,14 @@ let ws = null
 let reconnectDelay = 1000
 let reconnectTimer = null
 
+function detectBrowser() {
+  const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || ''
+  if (/Edg\//.test(ua)) return 'edge'
+  if (/Chrome/.test(ua)) return 'chrome'
+  if (/Firefox/.test(ua)) return 'firefox'
+  return 'unknown'
+}
+
 // Guard against browsers where webRequest isn't available (some Safari versions)
 try {
   setupNetworkMonitoring()
@@ -21,8 +29,15 @@ try {
 // Safari aggressively suspends MV3 service workers after ~30s of inactivity,
 // which kills the WebSocket. The alarm fires every ~24s to prevent suspension.
 // Guard: chrome.alarms was added in Safari 16.4 — not available in older versions.
+// Firefox enforces a minimum alarm interval of 1 minute — guard with try/catch.
 if (chrome.alarms) {
-  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_INTERVAL_MINUTES })
+  try {
+    chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_INTERVAL_MINUTES })
+  } catch {
+    // Firefox rejects sub-minute intervals; keepalive is less critical for Firefox
+    // background pages anyway, but create at 1 minute as a fallback
+    try { chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 }) } catch { /* ignore */ }
+  }
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name !== KEEPALIVE_ALARM) return
     if (!ws || ws.readyState === WebSocket.CLOSED) {
@@ -76,7 +91,7 @@ async function connect() {
   sock.addEventListener('open', async () => {
     console.log('[webster] Connected to MCP server')
     reconnectDelay = 1000
-    sock.send(JSON.stringify({ type: 'connected', version: chrome.runtime.getManifest().version }))
+    sock.send(JSON.stringify({ type: 'connected', version: chrome.runtime.getManifest().version, browser: detectBrowser() }))
     await updateState({ connected: true, port, lastError: null })
   })
 

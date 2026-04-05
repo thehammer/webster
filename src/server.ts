@@ -6,19 +6,27 @@ interface PendingCommand {
   timeoutHandle: ReturnType<typeof setTimeout>
 }
 
+interface ConnectedExtension {
+  id: string
+  browser: string
+  version: string
+  transport: 'ws' | 'http'
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ws?: any
+  pollResolve?: ((cmd: WsCommand) => void) | null
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ExtServer = Bun.Server<any>
 
 export class WebsterServer {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private extension: any = null
+  private extensions = new Map<string, ConnectedExtension>()
+  private activeExtensionId: string | null = null
   private pending = new Map<string, PendingCommand>()
   private server: ExtServer
   private commandTimeout: number
 
-  // HTTP long-poll transport (Safari)
-  private httpConnected = false
-  private pollResolve: ((cmd: WsCommand) => void) | null = null
+  // HTTP long-poll transport — result handlers indexed by command id
   private httpResultHandlers = new Map<string, (result: WsMessage) => void>()
 
   constructor(port: number, commandTimeout = 30000) {
@@ -47,30 +55,70 @@ export class WebsterServer {
     const url = new URL(req.url)
 
     if (req.method === 'POST' && url.pathname === '/connect') {
-      this.httpConnected = true
-      console.error('Webster: extension connected (HTTP)')
-      return new Response(null, { status: 204 })
+      let body: { browser?: string; version?: string } = {}
+      try {
+        body = await req.json() as { browser?: string; version?: string }
+      } catch {
+        // ignore — body is optional for backward compat
+      }
+      // Evict any stale HTTP connections for the same browser (SW restart without clean disconnect)
+      const browserName = body.browser ?? 'unknown'
+      for (const [existingId, existing] of this.extensions) {
+        if (existing.transport === 'http' && existing.browser === browserName) {
+          this.extensions.delete(existingId)
+          if (this.activeExtensionId === existingId) this.activeExtensionId = null
+        }
+      }
+
+      const id = crypto.randomUUID() as string
+      const ext: ConnectedExtension = {
+        id,
+        browser: browserName,
+        version: body.version ?? 'unknown',
+        transport: 'http',
+        pollResolve: null,
+      }
+      this.extensions.set(id, ext)
+      if (this.activeExtensionId === null) {
+        this.activeExtensionId = id
+      }
+      console.error(`Webster: extension v${ext.version} (${ext.browser}) connected (HTTP), id=${id}`)
+      return Response.json({ id })
     }
 
     if (req.method === 'DELETE' && url.pathname === '/connect') {
-      this.httpConnected = false
-      this.pollResolve = null
-      console.error('Webster: extension disconnected (HTTP)')
-      this.rejectPendingOnDisconnect()
+      const id = url.searchParams.get('id') ?? null
+      if (id) {
+        const ext = this.extensions.get(id)
+        if (ext) {
+          this.extensions.delete(id)
+          if (this.activeExtensionId === id) {
+            this.activeExtensionId = this.extensions.size > 0 ? this.extensions.keys().next().value! : null
+          }
+          console.error(`Webster: extension disconnected (HTTP), id=${id}`)
+          this.rejectPendingOnDisconnect()
+        }
+      }
       return new Response(null, { status: 204 })
     }
 
     if (req.method === 'GET' && url.pathname === '/poll') {
+      const id = url.searchParams.get('id') ?? null
+      const ext = id ? this.extensions.get(id) : null
+      if (!ext || ext.transport !== 'http') {
+        return new Response('Unknown extension id', { status: 404 })
+      }
+
       // Long-poll: hold the connection open until a command arrives or timeout
       return new Promise<Response>((resolve) => {
         const timer = setTimeout(() => {
-          this.pollResolve = null
+          ext.pollResolve = null
           resolve(Response.json({ type: 'keepalive' }))
         }, 25000)
 
-        this.pollResolve = (cmd: WsCommand) => {
+        ext.pollResolve = (cmd: WsCommand) => {
           clearTimeout(timer)
-          this.pollResolve = null
+          ext.pollResolve = null
           resolve(Response.json(cmd))
         }
       })
@@ -140,12 +188,28 @@ export class WebsterServer {
 
     if (!isResult(msg)) {
       // It's a WsEvent — the extension identifying itself
-      if (this.extension && this.extension !== ws) {
-        // Close the previously tracked connection cleanly
-        try { (this.extension as { close(): void }).close() } catch { /* ignore */ }
+      // Check if this ws is already tracked (re-handshake)
+      const existing = [...this.extensions.values()].find((e) => e.ws === ws)
+      if (existing) {
+        existing.browser = msg.browser ?? existing.browser
+        existing.version = msg.version
+        console.error(`Webster: extension v${existing.version} (${existing.browser}) re-connected`)
+        return
       }
-      this.extension = ws
-      console.error(`Webster: extension v${msg.version} connected`)
+
+      const id = crypto.randomUUID() as string
+      const ext: ConnectedExtension = {
+        id,
+        browser: msg.browser ?? 'unknown',
+        version: msg.version,
+        transport: 'ws',
+        ws,
+      }
+      this.extensions.set(id, ext)
+      if (this.activeExtensionId === null) {
+        this.activeExtensionId = id
+      }
+      console.error(`Webster: extension v${ext.version} (${ext.browser}) connected, id=${id}`)
       return
     }
 
@@ -163,17 +227,67 @@ export class WebsterServer {
   }
 
   private handleClose(ws: unknown) {
-    // Only clear extension if it was the tracked WS extension (not an HTTP client)
-    if (this.extension === ws) {
-      this.extension = null
-      console.error('Extension disconnected')
-      this.rejectPendingOnDisconnect()
+    const ext = [...this.extensions.values()].find((e) => e.ws === ws)
+    if (!ext) return
+
+    this.extensions.delete(ext.id)
+    if (this.activeExtensionId === ext.id) {
+      this.activeExtensionId = this.extensions.size > 0 ? this.extensions.keys().next().value! : null
+    }
+    console.error(`Webster: extension disconnected (${ext.browser}), id=${ext.id}`)
+    this.rejectPendingOnDisconnect()
+  }
+
+  private getActiveExtension(): ConnectedExtension {
+    if (this.extensions.size === 0) {
+      throw new Error('Extension not connected')
+    }
+    if (this.activeExtensionId !== null) {
+      const ext = this.extensions.get(this.activeExtensionId)
+      if (ext) return ext
+    }
+    if (this.extensions.size === 1) {
+      return this.extensions.values().next().value!
+    }
+    throw new Error('Multiple browsers connected — use set_browser to choose')
+  }
+
+  getBrowsers(): Array<{ id: string; browser: string; version: string; transport: string; active: boolean }> {
+    return [...this.extensions.values()].map((ext) => ({
+      id: ext.id,
+      browser: ext.browser,
+      version: ext.version,
+      transport: ext.transport,
+      active: ext.id === this.activeExtensionId,
+    }))
+  }
+
+  setBrowser(idOrBrowserName: string): { id: string; browser: string; version: string; transport: string; active: boolean } {
+    // Try exact id match first, then browser name match
+    let found: ConnectedExtension | undefined =
+      this.extensions.get(idOrBrowserName) ??
+      [...this.extensions.values()].find((e) => e.browser === idOrBrowserName)
+
+    if (!found) {
+      throw new Error(`No connected extension matching '${idOrBrowserName}'`)
+    }
+
+    this.activeExtensionId = found.id
+    return {
+      id: found.id,
+      browser: found.browser,
+      version: found.version,
+      transport: found.transport,
+      active: true,
     }
   }
 
   dispatch(command: Omit<WsCommand, 'id'>): Promise<unknown> {
-    if (!this.extension && !this.httpConnected) {
-      return Promise.reject(new Error('Extension not connected'))
+    let ext: ConnectedExtension
+    try {
+      ext = this.getActiveExtension()
+    } catch (err) {
+      return Promise.reject(err)
     }
 
     const id = crypto.randomUUID() as string
@@ -188,13 +302,12 @@ export class WebsterServer {
 
       this.pending.set(id, { resolve, reject, timeoutHandle })
 
-      if (this.extension) {
-        // WebSocket path (Chrome/Firefox)
-        this.extension!.send(JSON.stringify(msg))
+      if (ext.transport === 'ws') {
+        ext.ws!.send(JSON.stringify(msg))
       } else {
         // HTTP long-poll path (Safari)
-        if (this.pollResolve) {
-          this.pollResolve(msg)
+        if (ext.pollResolve) {
+          ext.pollResolve(msg)
         } else {
           // No active poll — reject immediately
           clearTimeout(timeoutHandle)
@@ -206,7 +319,7 @@ export class WebsterServer {
   }
 
   isConnected(): boolean {
-    return this.extension !== null || this.httpConnected
+    return this.extensions.size > 0
   }
 
   close(): void {
