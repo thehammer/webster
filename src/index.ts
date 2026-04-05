@@ -6,7 +6,16 @@ import { createTools } from './tools.js'
 
 const PORT = Number(process.env.WEBSTER_PORT ?? 3000)
 
-const wsServer = new WebsterServer(PORT)
+// If port is already in use (orphan from a previous session), kill it and retry.
+let wsServer: WebsterServer
+try {
+  wsServer = new WebsterServer(PORT)
+} catch {
+  console.error(`[webster] Port ${PORT} in use — freeing orphan process and retrying...`)
+  Bun.spawnSync(['sh', '-c', `lsof -ti :${PORT} | xargs kill -9 2>/dev/null || true`])
+  await new Promise(r => setTimeout(r, 300))
+  wsServer = new WebsterServer(PORT) // throws with real error if still busy
+}
 const tools = createTools(wsServer)
 
 const mcpServer = new Server(

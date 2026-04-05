@@ -9,6 +9,7 @@
     "activeTab",
     "scripting",
     "storage",
+    "alarms",
     "webRequest",
     "cookies"
   ],

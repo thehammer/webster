@@ -4,37 +4,39 @@ const commandCountEl = document.getElementById('commandCount')
 const errorEl = document.getElementById('error')
 
 function updateUI() {
-  try {
-    chrome.runtime.sendMessage({ type: 'GET_STATE' }, function (state) {
-      // Handle Safari/Chrome error when service worker isn't running yet
-      if (chrome.runtime.lastError || !state) {
-        return
-      }
+  // Read storage directly — bypasses sendMessage to diagnose whether the SW
+  // has ever run, independent of whether it's currently alive.
+  chrome.storage.local.get('websterState', function (r) {
+    const state = r.websterState
+    if (!state) {
+      statusEl.textContent = 'Disconnected'
+      statusEl.className = 'status disconnected'
+      errorEl.textContent = 'Storage empty — SW has never run'
+      errorEl.hidden = false
+      return
+    }
 
-      commandCountEl.textContent = state.commandsExecuted || 0
+    commandCountEl.textContent = state.commandsExecuted || 0
 
-      if (state.connected) {
-        statusEl.textContent = 'Connected'
-        statusEl.className = 'status connected'
-      } else {
-        statusEl.textContent = 'Disconnected'
-        statusEl.className = 'status disconnected'
-      }
+    if (state.connected) {
+      statusEl.textContent = 'Connected'
+      statusEl.className = 'status connected'
+    } else {
+      statusEl.textContent = 'Disconnected'
+      statusEl.className = 'status disconnected'
+    }
 
-      if (state.port && portEl.value !== String(state.port)) {
-        portEl.value = state.port
-      }
+    if (state.port && portEl.value !== String(state.port)) {
+      portEl.value = state.port
+    }
 
-      if (state.lastError) {
-        errorEl.textContent = state.lastError
-        errorEl.hidden = false
-      } else {
-        errorEl.hidden = true
-      }
-    })
-  } catch (e) {
-    // Service worker not available yet — popup still shows, just no state
-  }
+    if (state.lastError) {
+      errorEl.textContent = state.lastError
+      errorEl.hidden = false
+    } else {
+      errorEl.hidden = true
+    }
+  })
 }
 
 portEl.addEventListener('change', function () {
