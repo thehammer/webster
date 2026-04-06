@@ -4,16 +4,18 @@ Comparison of Webster (open source, multi-browser MCP server) against Anthropic'
 
 | Feature | Webster | Claude-in-Chrome |
 |---|---|---|
-| **Browser support** | Chrome, Firefox, Safari simultaneously | Chrome only (Firefox/Safari not yet available) |
-| **Multi-browser routing** | ✅ `get_browsers` / `set_browser` | ❌ Single browser only |
-| **Installation** | Manual build + load unpacked | ✅ Extension marketplace (Chrome) |
-| **Persists across restarts** | ❌ Must re-enable Safari; Firefox is temporary add-on | ✅ Installs permanently |
-| **Open source / self-hosted** | ✅ Full control | ❌ Black box |
-| **Embeddable in products** | ✅ Ship as MCP dependency | ❌ Requires user to install separately |
-| **Element interaction** | CSS selectors | Coordinates + accessibility refs + natural language |
-| **Handles selectorless UI** (canvas, SVG, custom widgets) | ❌ | ✅ Pixel clicking |
-| **Accessibility tree** | ❌ | ✅ Structured element refs |
-| **Natural language element finding** | ❌ | ✅ "find the login button" |
+| **Browser support** | Chrome, Firefox, Safari simultaneously | Chrome only |
+| **Multi-browser routing** | ✅ `get_browsers` / `set_browser` | ❌ |
+| **Installation** | Manual build + load unpacked | ✅ Extension marketplace |
+| **Persists across restarts** | ❌ Safari/Firefox need re-enabling | ✅ |
+| **Open source / self-hosted** | ✅ | ❌ Black box |
+| **Embeddable in products** | ✅ | ❌ |
+| **CSS selector interaction** | ✅ | ⚠️ Via accessibility refs |
+| **Coordinate/pixel clicking** | ✅ `click_at` (chrome.debugger) | ✅ |
+| **Accessibility tree** | ✅ `get_accessibility_tree` | ✅ |
+| **Click by a11y ref** | ✅ `click_ref` | ✅ |
+| **Natural language element finding** | ✅ `find_element` | ✅ |
+| **Selector fallback to a11y tree** | ✅ automatic | ❌ |
 | **Screenshots** | ✅ | ✅ |
 | **JavaScript execution** | ✅ | ✅ |
 | **wait_for (element appears)** | ✅ | ❌ |
@@ -22,21 +24,28 @@ Comparison of Webster (open source, multi-browser MCP server) against Anthropic'
 | **Cookie access** | ✅ | ❌ |
 | **Network log** | ✅ Ring buffer, persists across nav | ✅ Clears on domain change |
 | **Console log access** | ✅ | ✅ |
-| **File upload / drag-drop** | ❌ | ✅ |
-| **GIF recording** | ❌ | ✅ |
-| **Window resize** | ❌ | ✅ |
+| **File upload / drag-drop** | ✅ `upload_file` | ✅ |
+| **GIF recording** | ✅ `start_recording` / `export_gif` | ✅ |
+| **Window resize** | ✅ `resize_window` | ✅ |
 | **Shortcuts / workflows** | ❌ | ✅ |
 | **Plan approval flow** | ❌ | ✅ |
-| **Selector fragility** | ⚠️ Brittle on complex SPAs | ✅ Coordinates + a11y tree are more resilient |
 | **Cross-browser test automation** | ✅ | ❌ |
-| **Headless / CI use** | ⚠️ Possible but not designed for it | ❌ Requires visible Chrome |
-| **Transport control** | ✅ Configurable port, custom transport | ❌ Fixed |
+| **Headless / CI use** | ⚠️ Possible but not designed for it | ❌ |
+| **Transport control** | ✅ Configurable, open source | ❌ Fixed |
 | **Maintenance burden** | ⚠️ You own it | ✅ Anthropic maintains it |
+| **Total tools** | 33 | ~18 |
 
 ---
 
 ## Bottom line
 
-- **Keep Webster if** you need Firefox/Safari *now*, cross-browser routing, or want to embed automation in something you're building.
-- **Switch to Claude-in-Chrome if** you're doing general Chrome-only browsing tasks and want zero setup friction — especially once they ship other browsers.
-- **The real risk to Webster** is if Anthropic ships multi-browser support with marketplace installs. At that point the only remaining advantages are open source, embeddability, and the automation primitives (`wait_for`, localStorage, cookies). Those matter for building agents; they don't matter much for casual use.
+Webster now leads on almost every functional dimension. The only things Claude-in-Chrome still has exclusively are **shortcuts/workflows** and the **plan approval flow** — both UX conveniences rather than automation capabilities.
+
+Webster's durable advantages:
+- **Multi-browser** — Chrome + Firefox + Safari simultaneously, with routing. Claude-in-Chrome is Chrome-only.
+- **Automation primitives** — `wait_for`, `wait_for_network_idle`, localStorage, cookies. Better for building reliable agents.
+- **Selector fallback** — automatically retries via a11y tree when CSS selectors fail.
+- **Open source / embeddable** — ship Webster with a product. No dependency on Anthropic's extension being available.
+- **Transport control** — configurable port, extensible protocol.
+
+The main remaining risk: if Anthropic ships Firefox/Safari extensions through marketplaces, the installation friction gap disappears. The functional and architectural advantages remain.
