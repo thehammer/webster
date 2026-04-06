@@ -11,7 +11,9 @@
     "storage",
     "alarms",
     "webRequest",
-    "cookies"
+    "cookies",
+    "accessibility",
+    "debugger"
   ],
 
   "host_permissions": [

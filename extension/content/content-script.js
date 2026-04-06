@@ -66,14 +66,14 @@ async function handleCommand(cmd) {
 
       case 'click': {
         const el = cmd.selector ? document.querySelector(cmd.selector) : null
-        if (!el) return { success: false, error: `Element not found: ${cmd.selector}` }
+        if (!el) return { success: false, error: `Element not found: ${cmd.selector}`, selectorNotFound: true }
         el.click()
         return { success: true }
       }
 
       case 'type': {
         const el = cmd.selector ? document.querySelector(cmd.selector) : null
-        if (!el) return { success: false, error: `Element not found: ${cmd.selector}` }
+        if (!el) return { success: false, error: `Element not found: ${cmd.selector}`, selectorNotFound: true }
         el.focus()
         el.value = cmd.text || ''
         el.dispatchEvent(new Event('input', { bubbles: true }))

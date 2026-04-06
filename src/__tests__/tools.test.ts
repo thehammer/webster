@@ -34,17 +34,26 @@ const EXPECTED_TOOL_NAMES = [
   'find',
   'scroll_to',
   'get_attribute',
+  'get_accessibility_tree',
+  'click_at',
+  'click_ref',
+  'find_element',
   'get_browsers',
   'set_browser',
+  'upload_file',
+  'resize_window',
+  'start_recording',
+  'stop_recording',
+  'export_gif',
 ]
 
 describe('createTools', () => {
-  test('all 24 tools are present by name', () => {
+  test('all 33 tools are present by name', () => {
     const names = tools.map(t => t.name)
     for (const expected of EXPECTED_TOOL_NAMES) {
       expect(names).toContain(expected)
     }
-    expect(tools).toHaveLength(24)
+    expect(tools).toHaveLength(33)
   })
 
   test('all tools have description and inputSchema', () => {

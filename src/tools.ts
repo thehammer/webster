@@ -297,6 +297,175 @@ export function createTools(server: WebsterServer): WebsterTool[] {
     },
 
     {
+      name: 'get_accessibility_tree',
+      description: 'Get the accessibility tree of the current page — a semantic map of all elements with roles, names, and stable refs. More reliable than CSS selectors for understanding page structure. Use filter:"interactive" to get only actionable elements. Chrome/Edge only.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+          depth: { type: 'number', description: 'Max tree depth (default 10)' },
+          filter: { type: 'string', enum: ['all', 'interactive'], description: 'Filter to interactive elements only (default: all)' },
+        },
+      },
+      execute: (input) => dispatch('getAccessibilityTree', input),
+    },
+
+    {
+      name: 'click_at',
+      description: 'Click at specific (x, y) pixel coordinates. Use this for canvas elements, SVG, custom widgets, or anything without a reliable CSS selector. Requires Chrome/Edge.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          x: { type: 'number', description: 'X coordinate (pixels from left)' },
+          y: { type: 'number', description: 'Y coordinate (pixels from top)' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+        required: ['x', 'y'],
+      },
+      execute: (input) => dispatch('clickAt', input),
+    },
+
+    {
+      name: 'click_ref',
+      description: 'Click an element identified by an accessibility tree ref (from get_accessibility_tree). More reliable than coordinates for elements that may reflow. Requires Chrome/Edge.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ref: { type: 'string', description: 'Element ref from get_accessibility_tree (format: "role:name:left,top,width,height")' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+        required: ['ref'],
+      },
+      execute: (input) => dispatch('clickRef', input),
+    },
+
+    {
+      name: 'find_element',
+      description: 'Find page elements by natural language description (e.g. "login button", "email input field"). Returns up to 5 best matches with refs that can be used with click_ref. Requires Chrome/Edge.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'Natural language description of the element to find' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+          filter: { type: 'string', enum: ['all', 'interactive'], description: 'Filter to interactive elements (default: interactive)' },
+        },
+        required: ['query'],
+      },
+      execute: async (input) => {
+        const { query, tabId, filter = 'interactive' } = input as { query: string; tabId?: number; filter?: string }
+
+        const treeResult = await dispatch('getAccessibilityTree', { tabId, filter, depth: 10 }) as { role: string; name: string; ref: string; bounds: object; description?: string; children?: unknown[] } | null
+
+        if (!treeResult) throw new Error('Could not get accessibility tree')
+
+        const queryTokens = (query as string).toLowerCase().split(/[\s\-_]+/).filter(t => t.length > 1)
+
+        interface A11yNode { role: string; name: string; ref: string; bounds: object; description?: string; value?: string; children?: A11yNode[] }
+        interface ScoredNode { score: number; role: string; name: string; ref: string; bounds: object; description?: string }
+
+        function scoreNode(node: A11yNode): number {
+          const text = `${node.name || ''} ${node.description || ''} ${node.role || ''} ${node.value || ''}`.toLowerCase()
+          return queryTokens.filter(t => text.includes(t)).length
+        }
+
+        function collectNodes(node: A11yNode, results: ScoredNode[]) {
+          const score = scoreNode(node)
+          if (score > 0) {
+            results.push({ score, role: node.role, name: node.name, ref: node.ref, bounds: node.bounds, description: node.description })
+          }
+          if (node.children) node.children.forEach((c: A11yNode) => collectNodes(c, results))
+        }
+
+        const results: ScoredNode[] = []
+        collectNodes(treeResult as unknown as A11yNode, results)
+        results.sort((a, b) => b.score - a.score)
+
+        return results.slice(0, 5)
+      },
+    },
+
+    {
+      name: 'upload_file',
+      description: 'Upload a file to a <input type="file"> element or drag-drop target. Provide base64-encoded file content. Use selector for file inputs; use x/y coordinates for drag-drop targets.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          content: { type: 'string', description: 'Base64-encoded file content' },
+          filename: { type: 'string', description: 'Filename (e.g. "photo.jpg")' },
+          mimeType: { type: 'string', description: 'MIME type (default: application/octet-stream)' },
+          selector: { type: 'string', description: 'CSS selector for <input type="file"> element' },
+          x: { type: 'number', description: 'X coordinate of drag-drop target (if no selector)' },
+          y: { type: 'number', description: 'Y coordinate of drag-drop target (if no selector)' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+        required: ['content', 'filename'],
+      },
+      execute: (input) => {
+        const { selector } = input as { selector?: string }
+        const action = selector ? 'uploadFile' : 'dragDropFile'
+        return dispatch(action, input)
+      },
+    },
+
+    {
+      name: 'resize_window',
+      description: 'Resize the browser window to specified dimensions. Useful for testing responsive layouts.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          width: { type: 'number', description: 'Window width in pixels' },
+          height: { type: 'number', description: 'Window height in pixels' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+        required: ['width', 'height'],
+      },
+      execute: (input) => dispatch('resizeWindow', input),
+    },
+
+    {
+      name: 'start_recording',
+      description: 'Start recording browser frames for GIF export. Captures screenshots at the specified FPS. Call stop_recording or export_gif when done.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fps: { type: 'number', description: 'Frames per second (default: 2)' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+      },
+      execute: (input) => dispatch('startRecording', input),
+    },
+
+    {
+      name: 'stop_recording',
+      description: 'Stop recording and return the captured frames as base64 PNG data URLs.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+      },
+      execute: (input) => dispatch('stopRecording', input),
+    },
+
+    {
+      name: 'export_gif',
+      description: 'Stop recording and export the captured frames as an animated GIF. Returns a base64 data URL of the GIF. Uses ffmpeg if available, pure-JS encoder otherwise.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          fps: { type: 'number', description: 'Frames per second for the GIF (default: 2)' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+      },
+      execute: async (input) => {
+        const result = await dispatch('stopRecording', input) as { frames: { dataUrl: string; timestamp: number }[] }
+        if (!result?.frames?.length) throw new Error('No frames recorded')
+        const { encodeGif } = await import('./gif.js')
+        return encodeGif(result.frames, (input as { fps?: number }).fps ?? 2)
+      },
+    },
+
+    {
       name: 'get_browsers',
       description: 'List all connected browser extensions. Use this to see which browsers are available before using set_browser.',
       inputSchema: { type: 'object', properties: {} },
