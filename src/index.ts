@@ -4,7 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { WebsterServer } from './server.js'
 import { createTools } from './tools.js'
 
-const PORT = Number(process.env.WEBSTER_PORT ?? 3000)
+const PORT = Number(process.env.WEBSTER_PORT ?? 3456)
 
 // If port is already in use (orphan from a previous session), kill it and retry.
 let wsServer: WebsterServer

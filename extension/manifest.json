@@ -11,6 +11,7 @@
     "storage",
     "alarms",
     "webRequest",
+    "webNavigation",
     "cookies",
     "accessibility",
     "debugger"

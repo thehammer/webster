@@ -466,6 +466,38 @@ export function createTools(server: WebsterServer): WebsterTool[] {
     },
 
     {
+      name: 'start_capture',
+      description: 'Start deep network capture using Chrome Debugger Protocol. Captures FULL request/response bodies, headers, and timing across ALL windows including popups. Shows a "debugging" infobar on captured tabs. Use stop_capture to finish and retrieve data.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          urlFilter: { type: 'string', description: 'Only capture requests where URL contains this string (e.g. "extendedcare.com"). Omit to capture everything.' },
+        },
+      },
+      execute: (input) => dispatch('startCapture', input),
+    },
+
+    {
+      name: 'stop_capture',
+      description: 'Stop deep network capture and return all captured request/response data. Detaches debugger from all tabs.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+      execute: () => dispatch('stopCapture'),
+    },
+
+    {
+      name: 'get_capture',
+      description: 'Peek at captured network data without stopping the capture. Returns current entries and count of pending (in-flight) requests.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+      execute: () => dispatch('getCapture'),
+    },
+
+    {
       name: 'get_browsers',
       description: 'List all connected browser extensions. Use this to see which browsers are available before using set_browser.',
       inputSchema: { type: 'object', properties: {} },

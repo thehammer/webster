@@ -8,6 +8,198 @@
 const networkLog = []
 const MAX_NETWORK_LOG = 500
 
+// ─── Deep capture state (Chrome Debugger API) ──────────────────────────────
+// Captures full request/response bodies across ALL windows including popups.
+// Use startCapture/stopCapture/getCapture actions to control.
+let captureActive = false
+let captureBuffer = []           // completed request/response pairs
+let capturePending = new Map()   // requestId -> partial entry (waiting for response body)
+let capturedTabs = new Set()     // tabIds with debugger attached
+let captureUrlFilter = null      // only capture URLs containing this string
+const MAX_CAPTURE_BODY = 512000  // 500KB max per response body
+const MAX_CAPTURE_ENTRIES = 2000
+
+function matchesCaptureFilter(url) {
+  if (!captureUrlFilter) return true
+  return url.toLowerCase().includes(captureUrlFilter.toLowerCase())
+}
+
+async function attachDebuggerToTab(tabId) {
+  if (capturedTabs.has(tabId)) return
+  try {
+    const tab = await chrome.tabs.get(tabId)
+    // Skip internal browser pages — can't debug those
+    if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://')) return
+    await chrome.debugger.attach({ tabId }, '1.3')
+    await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
+    // Auto-attach to popups/new windows opened from this tab
+    try {
+      await chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', {
+        autoAttach: true,
+        waitForDebuggerOnStart: true,  // pause new targets so we don't miss requests
+        flatten: true,
+      })
+    } catch { /* Target.setAutoAttach may not be supported in all browsers */ }
+    capturedTabs.add(tabId)
+  } catch (e) {
+    // Already attached or not debuggable — ignore
+  }
+}
+
+async function detachDebuggerFromTab(tabId) {
+  if (!capturedTabs.has(tabId)) return
+  try {
+    await chrome.debugger.detach({ tabId })
+  } catch { /* ignore */ }
+  capturedTabs.delete(tabId)
+}
+
+function onCaptureTabCreated(tab) {
+  if (captureActive && tab.id) {
+    attachDebuggerToTab(tab.id)
+  }
+}
+
+// Also catch tabs via webNavigation — fires earlier than onCreated for popups
+function onCaptureNavigation(details) {
+  if (captureActive && details.tabId && details.frameId === 0) {
+    attachDebuggerToTab(details.tabId)
+  }
+}
+
+// Chrome Debugger Protocol events
+function handleDebuggerEvent(source, method, params) {
+  if (!captureActive) return
+  const tabId = source.tabId
+
+  // Handle auto-attached targets (popups opened from a debugged tab)
+  if (method === 'Target.attachedToTarget') {
+    const { sessionId, targetInfo } = params
+    if (targetInfo?.type === 'page' && sessionId) {
+      // Enable network monitoring on the new target and resume it
+      try {
+        chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
+        chrome.debugger.sendCommand({ tabId }, 'Runtime.runIfWaitingForDebugger', {})
+      } catch { /* ignore */ }
+    }
+    return
+  }
+
+  // Namespace requestId by tabId — requestIds are only unique per tab
+  const key = `${tabId}:${params.requestId}`
+
+  if (method === 'Network.requestWillBeSent') {
+    const { request, type, timestamp, redirectResponse } = params
+    if (!matchesCaptureFilter(request.url)) return
+
+    // If this is a redirect, finalize the redirect entry
+    if (redirectResponse && capturePending.has(key)) {
+      const prev = capturePending.get(key)
+      prev.status = redirectResponse.status
+      prev.responseHeaders = redirectResponse.headers || {}
+      prev.mimeType = redirectResponse.mimeType
+      prev.responseBody = null // redirects have no body
+      prev.endTime = timestamp
+      prev.duration = Math.round((timestamp - prev._startTimestamp) * 1000)
+      prev.redirectedTo = request.url
+      captureBuffer.push(prev)
+      if (captureBuffer.length > MAX_CAPTURE_ENTRIES) captureBuffer.shift()
+    }
+
+    capturePending.set(key, {
+      tabId,
+      url: request.url,
+      method: request.method,
+      type,
+      requestHeaders: request.headers || {},
+      requestBody: request.postData || null,
+      status: null,
+      responseHeaders: {},
+      responseBody: null,
+      mimeType: null,
+      startTime: new Date(timestamp * 1000).toISOString(),
+      _startTimestamp: timestamp,
+      _requestId: params.requestId,
+      endTime: null,
+      duration: null,
+      error: null,
+    })
+  }
+
+  if (method === 'Network.responseReceived') {
+    const entry = capturePending.get(key)
+    if (!entry) return
+    entry.status = params.response.status
+    entry.responseHeaders = params.response.headers || {}
+    entry.mimeType = params.response.mimeType
+  }
+
+  if (method === 'Network.loadingFinished') {
+    const { timestamp } = params
+    const entry = capturePending.get(key)
+    if (!entry) return
+    entry.endTime = new Date(timestamp * 1000).toISOString()
+    entry.duration = Math.round((timestamp - entry._startTimestamp) * 1000)
+
+    // Fetch response body — only for text-based content
+    const mime = (entry.mimeType || '').toLowerCase()
+    const isText = mime.includes('json') || mime.includes('html') || mime.includes('xml') ||
+                   mime.includes('text') || mime.includes('javascript') || mime.includes('css') ||
+                   mime.includes('form') || mime.includes('svg')
+
+    if (isText && tabId) {
+      chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId: params.requestId })
+        .then((result) => {
+          if (result?.body) {
+            entry.responseBody = result.body.length > MAX_CAPTURE_BODY
+              ? result.body.slice(0, MAX_CAPTURE_BODY) + `...[truncated, ${result.body.length} total]`
+              : result.body
+          }
+          if (result?.base64Encoded) entry.responseBodyEncoding = 'base64'
+          finalizeEntry(key, entry)
+        })
+        .catch(() => {
+          // Body may not be available (e.g. cached, opaque) — finalize without it
+          finalizeEntry(key, entry)
+        })
+    } else {
+      // Binary content — record metadata only, skip body
+      entry.responseBody = `[binary: ${mime}, not captured]`
+      finalizeEntry(key, entry)
+    }
+  }
+
+  if (method === 'Network.loadingFailed') {
+    const { errorText, timestamp } = params
+    const entry = capturePending.get(key)
+    if (!entry) return
+    entry.error = errorText
+    entry.endTime = new Date(timestamp * 1000).toISOString()
+    entry.duration = Math.round((timestamp - entry._startTimestamp) * 1000)
+    finalizeEntry(key, entry)
+  }
+}
+
+function finalizeEntry(key, entry) {
+  capturePending.delete(key)
+  delete entry._startTimestamp
+  delete entry._requestId
+  captureBuffer.push(entry)
+  if (captureBuffer.length > MAX_CAPTURE_ENTRIES) captureBuffer.shift()
+}
+
+// Clean up when a debugged tab closes
+chrome.tabs.onRemoved.addListener((tabId) => {
+  capturedTabs.delete(tabId)
+})
+
+// Clean up when debugger is detached (user clicked "cancel" on infobar, or DevTools opened)
+if (chrome.debugger?.onDetach) {
+  chrome.debugger.onDetach.addListener((source) => {
+    capturedTabs.delete(source.tabId)
+  })
+}
+
 // GIF recording state
 let recordingActive = false
 let recordingFrames = []
@@ -463,6 +655,76 @@ export async function executeCommand(command) {
           args: [command.selector || null, command.x || 0, command.y || 0, command.content, command.filename, command.mimeType || 'application/octet-stream'],
         })
         return results?.[0]?.result ?? { success: false, error: 'Script injection failed' }
+      }
+
+      case 'startCapture': {
+        if (captureActive) {
+          // Stop existing capture first
+          for (const tabId of capturedTabs) {
+            await detachDebuggerFromTab(tabId)
+          }
+          chrome.tabs.onCreated.removeListener(onCaptureTabCreated)
+        }
+
+        captureActive = true
+        captureBuffer = []
+        capturePending = new Map()
+        capturedTabs = new Set()
+        captureUrlFilter = command.urlFilter || null
+
+        // Register the debugger event handler (remove first to avoid double-registering)
+        try { chrome.debugger.onEvent.removeListener(handleDebuggerEvent) } catch { /* ignore */ }
+        chrome.debugger.onEvent.addListener(handleDebuggerEvent)
+
+        // Listen for new tabs and navigations (catches popups)
+        chrome.tabs.onCreated.removeListener(onCaptureTabCreated)
+        chrome.tabs.onCreated.addListener(onCaptureTabCreated)
+        if (chrome.webNavigation) {
+          chrome.webNavigation.onBeforeNavigate.removeListener(onCaptureNavigation)
+          chrome.webNavigation.onBeforeNavigate.addListener(onCaptureNavigation)
+        }
+
+        // Attach to all existing tabs
+        // Attach to all existing tabs in parallel (sequential was causing 30s timeout)
+        const allTabs = await chrome.tabs.query({})
+        await Promise.allSettled(allTabs.map(tab => attachDebuggerToTab(tab.id)))
+
+        return { success: true, data: { tabsAttached: capturedTabs.size, urlFilter: captureUrlFilter } }
+      }
+
+      case 'stopCapture': {
+        captureActive = false
+        chrome.tabs.onCreated.removeListener(onCaptureTabCreated)
+        if (chrome.webNavigation) {
+          chrome.webNavigation.onBeforeNavigate.removeListener(onCaptureNavigation)
+        }
+
+        // Detach debugger from all tabs
+        for (const tabId of capturedTabs) {
+          await detachDebuggerFromTab(tabId)
+        }
+
+        // Wait a moment for any in-flight getResponseBody calls to complete
+        await new Promise(r => setTimeout(r, 500))
+
+        // Flush any remaining pending entries (incomplete requests)
+        for (const [requestId, entry] of capturePending) {
+          delete entry._startTimestamp
+          entry.responseBody = entry.responseBody || '[incomplete — capture stopped]'
+          captureBuffer.push(entry)
+        }
+        capturePending.clear()
+
+        const result = [...captureBuffer]
+        captureBuffer = []
+        return { success: true, data: result }
+      }
+
+      case 'getCapture': {
+        // Peek at current capture without stopping
+        const snapshot = [...captureBuffer]
+        const pending = capturePending.size
+        return { success: true, data: { entries: snapshot, pendingRequests: pending, active: captureActive } }
       }
 
       case 'resizeWindow': {

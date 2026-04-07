@@ -2,7 +2,7 @@
 // receives commands and dispatches them to the browser.
 import { executeCommand, setupNetworkMonitoring } from './command-handlers.js'
 
-const DEFAULT_PORT = 3000
+const DEFAULT_PORT = 3456
 const KEEPALIVE_ALARM = 'webster-keepalive'
 const KEEPALIVE_INTERVAL_MINUTES = 0.4 // ~24s, well under Safari's ~30s suspend threshold
 
