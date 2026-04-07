@@ -45,15 +45,18 @@ const EXPECTED_TOOL_NAMES = [
   'start_recording',
   'stop_recording',
   'export_gif',
+  'start_capture',
+  'stop_capture',
+  'get_capture',
 ]
 
 describe('createTools', () => {
-  test('all 33 tools are present by name', () => {
+  test('all 36 tools are present by name', () => {
     const names = tools.map(t => t.name)
     for (const expected of EXPECTED_TOOL_NAMES) {
       expect(names).toContain(expected)
     }
-    expect(tools).toHaveLength(33)
+    expect(tools).toHaveLength(36)
   })
 
   test('all tools have description and inputSchema', () => {
