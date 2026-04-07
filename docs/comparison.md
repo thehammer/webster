@@ -27,13 +27,14 @@ Comparison of Webster (open source, multi-browser MCP server) against Anthropic'
 | **File upload / drag-drop** | ✅ `upload_file` | ✅ |
 | **GIF recording** | ✅ `start_recording` / `export_gif` | ✅ |
 | **Window resize** | ✅ `resize_window` | ✅ |
+| **Deep network capture** | ✅ `start_capture` — full req/res bodies via Debugger Protocol | ❌ |
 | **Shortcuts / workflows** | ❌ | ✅ |
 | **Plan approval flow** | ❌ | ✅ |
 | **Cross-browser test automation** | ✅ | ❌ |
 | **Headless / CI use** | ⚠️ Possible but not designed for it | ❌ |
 | **Transport control** | ✅ Configurable, open source | ❌ Fixed |
 | **Maintenance burden** | ⚠️ You own it | ✅ Anthropic maintains it |
-| **Total tools** | 33 | ~18 |
+| **Total tools** | 36 | ~18 |
 
 ---
 

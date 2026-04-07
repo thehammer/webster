@@ -4,9 +4,11 @@ Goal: functional parity with (and superiority over) Anthropic's Claude-in-Chrome
 
 Marketplace/distribution improvements are explicitly out of scope for now.
 
+> **Status:** All phases complete. ✅
+
 ---
 
-## Phase 1 — Accessibility Tree *(foundation for phases 2–4)*
+## Phase 1 — Accessibility Tree ✅ *(foundation for phases 2–4)*
 
 **What:** Expose the browser's built-in semantic element tree — the same structure screen readers use. Every element gets a role, name, state, bounds, and a stable ref string. More reliable than CSS selectors for understanding what's interactive.
 
@@ -26,7 +28,7 @@ Marketplace/distribution improvements are explicitly out of scope for now.
 
 ---
 
-## Phase 2 — Coordinate/Pixel Clicking
+## Phase 2 — Coordinate/Pixel Clicking ✅
 
 **What:** Click at (x, y) coordinates using `chrome.debugger` to dispatch real mouse events at the OS level. Works on canvas, SVG, WebGL, and anything without a DOM selector.
 
@@ -43,7 +45,7 @@ Marketplace/distribution improvements are explicitly out of scope for now.
 
 ---
 
-## Phase 3 — Selector Fallback
+## Phase 3 — Selector Fallback ✅
 
 **What:** When a CSS selector fails, automatically fall back to the accessibility tree. Improves reliability of existing `click` and `type` tools on complex SPAs without changing their interface.
 
@@ -57,7 +59,7 @@ Marketplace/distribution improvements are explicitly out of scope for now.
 
 ---
 
-## Phase 4 — Natural Language Element Finding
+## Phase 4 — Natural Language Element Finding ✅
 
 **What:** Find elements by description ("the login button", "email input") without knowing CSS selectors. Builds on Phase 1 — queries the a11y tree and scores nodes by token overlap against the query.
 
@@ -73,7 +75,7 @@ Marketplace/distribution improvements are explicitly out of scope for now.
 
 ---
 
-## Phase 5 — File Upload
+## Phase 5 — File Upload ✅
 
 **What:** Upload files to `<input type="file">` elements and drag-drop targets.
 
@@ -90,7 +92,7 @@ Marketplace/distribution improvements are explicitly out of scope for now.
 
 ---
 
-## Phase 6 — Window Resize
+## Phase 6 — Window Resize ✅
 
 **What:** Resize the browser window. `chrome.windows` is already available — this is a one-handler addition.
 
@@ -105,7 +107,7 @@ Marketplace/distribution improvements are explicitly out of scope for now.
 
 ---
 
-## Phase 7 — GIF Recording
+## Phase 7 — GIF Recording ✅
 
 **What:** Record browser automation sessions as animated GIFs.
 
@@ -125,25 +127,47 @@ Marketplace/distribution improvements are explicitly out of scope for now.
 
 ---
 
+## Phase 8 — Deep Network Capture ✅
+
+**What:** Full request/response body capture using the Chrome Debugger Protocol. Unlike `get_network_log` (which only records URL/status/timing from `webRequest`), deep capture attaches `chrome.debugger` to all tabs and uses `Network.getResponseBody` to capture complete request and response payloads.
+
+**Files changed:**
+- `extension/manifest.json` — add `"webNavigation"` permission
+- `extension/background/command-handlers.js` — add capture state machine, debugger event handler, auto-attach to new tabs/popups
+- `src/tools.ts` — add `start_capture`, `stop_capture`, `get_capture` tools
+
+**New tools:**
+- `start_capture` — parameters: `urlFilter?: string` — attach debugger to all tabs, start recording
+- `stop_capture` — detach all debuggers, return captured entries
+- `get_capture` — peek at current capture buffer without stopping
+
+**Key implementation notes:**
+- Auto-attaches to new tabs and popups via `chrome.tabs.onCreated`, `chrome.webNavigation.onBeforeNavigate`, and `Target.setAutoAttach`
+- Request IDs namespaced by tabId (they're only unique per-tab)
+- Handles redirects, binary content (metadata only), loading failures
+- Response bodies truncated at 500KB, buffer capped at 2000 entries
+- Shows Chrome's "debugging" infobar on captured tabs — this is intentional and cannot be suppressed
+
+---
+
 ## Implementation Order
 
-| Phase | Feature | New Tools | Depends On | Manifest Change |
-|---|---|---|---|---|
-| 1 | Accessibility tree | `get_accessibility_tree` | — | `+accessibility` |
-| 2 | Coordinate clicking | `click_at`, `click_ref` | Phase 1 | `+debugger` |
-| 3 | Selector fallback | none | Phase 1 | — |
-| 4 | Natural language find | `find_element` | Phase 1 | — |
-| 5 | File upload | `upload_file` | — | — |
-| 6 | Window resize | `resize_window` | — | — |
-| 7 | GIF recording | `start_recording`, `stop_recording`, `export_gif` | — | — |
-
-Phases 5, 6, 7 are independent and can be done in any order. Phases 2, 3, 4 each require Phase 1 first.
+| Phase | Feature | New Tools | Depends On | Manifest Change | Status |
+|---|---|---|---|---|---|
+| 1 | Accessibility tree | `get_accessibility_tree` | — | `+accessibility` | ✅ |
+| 2 | Coordinate clicking | `click_at`, `click_ref` | Phase 1 | `+debugger` | ✅ |
+| 3 | Selector fallback | none | Phase 1 | — | ✅ |
+| 4 | Natural language find | `find_element` | Phase 1 | — | ✅ |
+| 5 | File upload | `upload_file` | — | — | ✅ |
+| 6 | Window resize | `resize_window` | — | — | ✅ |
+| 7 | GIF recording | `start_recording`, `stop_recording`, `export_gif` | — | — | ✅ |
+| 8 | Deep network capture | `start_capture`, `stop_capture`, `get_capture` | — | `+webNavigation` | ✅ |
 
 ---
 
 ## What NOT To Do
 
-- **No persistent debugger attachment** — attach per-command, detach immediately. Persistent attachment shows a warning banner and breaks DevTools.
+- **No persistent debugger attachment** — attach per-command, detach immediately. Exception: `start_capture` intentionally holds persistent attachment for the duration of the capture session (shows warning banner to user).
 - **No a11y tree in content scripts** — `chrome.automation` is service-worker-only.
 - **No replacing CSS selectors** — they work for 95% of cases. A11y tree and coordinates are supplements, not replacements.
 - **No LLM calls inside Webster** — natural language matching is pure token scoring. The MCP caller already handles language understanding.

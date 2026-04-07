@@ -85,7 +85,7 @@ When only one browser is connected, it's selected automatically.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WEBSTER_PORT` | `3000` | Port the extension connects to |
+| `WEBSTER_PORT` | `3456` | Port the extension connects to |
 
 ## Tools
 
@@ -109,12 +109,24 @@ When only one browser is connected, it's selected automatically.
 | `open_tab` | Open a new tab |
 | `close_tab` | Close a tab |
 | `switch_tab` | Switch to a tab |
+| `get_accessibility_tree` | Get the browser's semantic element tree |
+| `click_at` | Click at (x, y) coordinates via debugger |
+| `click_ref` | Click an element by accessibility ref |
+| `find_element` | Find elements by natural language description |
+| `upload_file` | Upload a file to an input or drag-drop target |
+| `resize_window` | Resize the browser window |
 | `get_network_log` | Get buffered network requests |
 | `wait_for_network_idle` | Wait until no in-flight requests |
+| `start_capture` | Start deep network capture (full bodies via Chrome Debugger) |
+| `stop_capture` | Stop capture and return all captured data |
+| `get_capture` | Peek at captured data without stopping |
 | `get_cookies` | Get cookies for a URL |
 | `get_local_storage` | Read localStorage |
 | `set_local_storage` | Write localStorage |
 | `read_console` | Get buffered console output |
+| `start_recording` | Start recording browser session frames |
+| `stop_recording` | Stop recording and return frames |
+| `export_gif` | Encode captured frames as animated GIF |
 
 ## Development
 
