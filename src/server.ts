@@ -64,6 +64,9 @@ export class WebsterServer {
   // HTTP long-poll transport — result handlers indexed by command id
   private httpResultHandlers = new Map<string, (result: WsMessage) => void>()
 
+  // MCP HTTP handler — set by index.ts after session manager is created
+  private mcpHandler: ((req: Request) => Promise<Response>) | null = null
+
   // Tab ownership — soft advisory locking for concurrent Claude sessions
   private tabOwnership = new Map<number, string>() // tabId → 'port:pid'
 
@@ -88,9 +91,18 @@ export class WebsterServer {
     return this.server.port as number
   }
 
+  setMcpHandler(handler: (req: Request) => Promise<Response>): void {
+    this.mcpHandler = handler
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async handleFetch(req: Request, server: any): Promise<Response> {
     const url = new URL(req.url)
+
+    if (url.pathname === '/mcp') {
+      if (this.mcpHandler) return this.mcpHandler(req)
+      return new Response('MCP not configured', { status: 503 })
+    }
 
     if (req.method === 'POST' && url.pathname === '/connect') {
       let body: { browser?: string; version?: string } = {}
