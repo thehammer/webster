@@ -1,10 +1,12 @@
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, afterAll } from 'bun:test'
 import { createTools } from '../tools.js'
 import type { WebsterServer } from '../server.js'
 
 import { CaptureSession } from '../capture.js'
 
 const mockSession = new CaptureSession('test-tools', { urlFilter: null })
+
+afterAll(() => { mockSession.cleanup() })
 
 const mockServer = {
   dispatch: async (_cmd: Record<string, unknown>) => ({ success: true }),

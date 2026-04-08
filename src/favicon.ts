@@ -1,0 +1,30 @@
+// Webster favicon — icon-c (purple spider) as inline SVG
+export const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="22" fill="#0f172a"/>
+  <g stroke="#7c3aed" stroke-width="2" stroke-linecap="round" opacity="0.6">
+    <line x1="64" y1="64" x2="64" y2="10"/>
+    <line x1="64" y1="64" x2="110.8" y2="37"/>
+    <line x1="64" y1="64" x2="110.8" y2="91"/>
+    <line x1="64" y1="64" x2="64" y2="118"/>
+    <line x1="64" y1="64" x2="17.2" y2="91"/>
+    <line x1="64" y1="64" x2="17.2" y2="37"/>
+  </g>
+  <polygon points="64,46 79.6,55 79.6,73 64,82 48.4,73 48.4,55" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linejoin="round" opacity="0.6"/>
+  <polygon points="64,30 93.4,47 93.4,81 64,98 34.6,81 34.6,47" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linejoin="round" opacity="0.6"/>
+  <polygon points="64,14 107.3,39 107.3,89 64,114 20.7,89 20.7,39" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linejoin="round" opacity="0.6"/>
+  <ellipse cx="64" cy="70" rx="10" ry="13" fill="#c084fc"/>
+  <circle cx="64" cy="54" r="8" fill="#c084fc"/>
+  <circle cx="61" cy="53" r="1.8" fill="#0f172a"/>
+  <circle cx="67" cy="53" r="1.8" fill="#0f172a"/>
+  <g stroke="#c084fc" stroke-width="2" stroke-linecap="round" fill="none">
+    <path d="M56,52 Q46,44 36,42"/>
+    <path d="M56,56 Q46,52 36,54"/>
+    <path d="M56,60 Q46,62 36,68"/>
+    <path d="M56,64 Q46,70 38,78"/>
+    <path d="M72,52 Q82,44 92,42"/>
+    <path d="M72,56 Q82,52 92,54"/>
+    <path d="M72,60 Q82,62 92,68"/>
+    <path d="M72,64 Q82,70 90,78"/>
+  </g>
+  <text x="64" y="74" text-anchor="middle" dominant-baseline="middle" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="bold" fill="#0f172a">w</text>
+</svg>`

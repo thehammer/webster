@@ -1,6 +1,8 @@
 // Webster Dashboard — self-contained HTML page served at /dashboard
 // Provides capture controls, server status, and session history.
 
+import { FAVICON_SVG } from './favicon.js'
+
 export function buildDashboardHtml(port: number): string {
   const base = `http://localhost:${port}`
   return `<!DOCTYPE html>
@@ -9,6 +11,7 @@ export function buildDashboardHtml(port: number): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Webster Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(FAVICON_SVG)}">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; }

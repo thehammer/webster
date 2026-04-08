@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync } from 'fs'
 import { join } from 'path'
+import { FAVICON_SVG } from './favicon.js'
 
 // ─── Route handler ───────────────────────────────────────────────────────────
 
@@ -109,6 +110,7 @@ function buildReplayHtml(sessionId: string): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Webster Replay</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(FAVICON_SVG)}">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; overflow: hidden; height: 100vh; }
