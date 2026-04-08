@@ -38,7 +38,8 @@ Comparison of Webster (open source, multi-browser MCP server) against Anthropic'
 | **Drag-and-drop (mouse)** | ✅ `drag` | ❌ |
 | **Keyboard key press** | ✅ `key_press` (+ modifiers) | ⚠️ Via type/form input |
 | **Input event monitoring** | ✅ `get_input_log` | ❌ |
-| **Concurrent session support** | ✅ Multi-server, `claim_tab`/`release_tab` | ❌ Single session |
+| **Concurrent session support** | ✅ HTTP MCP, shared persistent server, `claim_tab`/`release_tab` | ❌ Single session |
+| **Server architecture** | ✅ Persistent launchd service, HTTP MCP transport | ❌ Subprocess per session |
 | **Server registry** | ✅ `~/.webster/registry.json` | ❌ |
 | **Total tools** | 42 | ~18 |
 
@@ -50,9 +51,10 @@ Webster now leads on almost every functional dimension. The only things Claude-i
 
 Webster's durable advantages:
 - **Multi-browser** — Chrome + Firefox + Safari simultaneously, with routing. Claude-in-Chrome is Chrome-only.
-- **Automation primitives** — `wait_for`, `wait_for_network_idle`, localStorage, cookies. Better for building reliable agents.
+- **Concurrent sessions** — persistent HTTP MCP server handles multiple Claude Code sessions at once with shared browser access. Claude-in-Chrome spawns a new subprocess per session.
+- **Automation primitives** — `wait_for`, `wait_for_network_idle`, localStorage, cookies, hover, drag, key_press. Better for building reliable agents.
 - **Selector fallback** — automatically retries via a11y tree when CSS selectors fail.
 - **Open source / embeddable** — ship Webster with a product. No dependency on Anthropic's extension being available.
-- **Transport control** — configurable port, extensible protocol.
+- **Input monitoring** — `get_input_log` captures real user mouse/keyboard activity.
 
 The main remaining risk: if Anthropic ships Firefox/Safari extensions through marketplaces, the installation friction gap disappears. The functional and architectural advantages remain.

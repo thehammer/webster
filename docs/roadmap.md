@@ -4,7 +4,7 @@ Goal: functional parity with (and superiority over) Anthropic's Claude-in-Chrome
 
 Marketplace/distribution improvements are explicitly out of scope for now.
 
-> **Status:** All phases complete. ✅
+> **Status:** All phases complete. ✅ (42 tools, persistent HTTP MCP server)
 
 ---
 
@@ -312,6 +312,43 @@ async function withDebugger(tabId, fn) {
 | 10-B | hover + drag | `hover`, `drag` | `tools.ts` + handlers | ✅ |
 | 10-C | key_press | `key_press` | `tools.ts` + handlers | ✅ |
 | 10-D | Input monitoring | `get_input_log` | `page-script.js` | ✅ |
+
+---
+
+---
+
+## Phase 11 — Persistent HTTP MCP Transport ✅
+
+**What:** Replace the per-session stdio subprocess model with a single persistent server that handles multiple Claude Code sessions concurrently over HTTP. Each Claude Code session gets an independent MCP connection; all share the same browser extension connection.
+
+**Architecture change:**
+```
+Before: Claude Code → forks bun subprocess (stdio) → WebSocket → extension
+After:  Claude Code → HTTP POST /mcp → persistent server (launchd) → WebSocket → extension
+```
+
+**Files changed:**
+- `src/mcp.ts` (new) — `McpSessionManager` class manages one `WebStandardStreamableHTTPServerTransport` + `Server` per MCP client session; sessions tracked by `mcp-session-id` header, cleaned up on close
+- `src/server.ts` — add `setMcpHandler()` and `/mcp` route
+- `src/index.ts` — remove orphan-killer; wire `McpSessionManager` into HTTP server; keep `WEBSTER_MCP_MODE=stdio` for backward compat
+- `src/__tests__/mcp.test.ts` (new) — 7 tests covering session lifecycle, 404 on unknown session, independent sessions
+
+**Claude Code config** changed from `command/args` (stdio) to `url: http://localhost:3456/mcp`.
+
+**Key implementation notes:**
+- Uses `WebStandardStreamableHTTPServerTransport` from MCP SDK 1.29+ — native Bun support, no Node.js compatibility shim needed
+- Stateful mode: each `initialize` request creates a new session with a UUID; subsequent requests carry `mcp-session-id` header
+- `onsessionclosed` callback cleans up sessions on DELETE or disconnect
+- `WEBSTER_MCP_MODE=stdio` env var preserves backward compat for single-session stdio usage
+
+**Phase 11 implementation table:**
+
+| Phase | Feature | New Files | Status |
+|---|---|---|---|
+| 11-A | `McpSessionManager` | `src/mcp.ts` | ✅ |
+| 11-B | `/mcp` HTTP route in server | `src/server.ts` | ✅ |
+| 11-C | Simplified index.ts | `src/index.ts` | ✅ |
+| 11-D | HTTP MCP session tests | `src/__tests__/mcp.test.ts` | ✅ |
 
 ---
 
