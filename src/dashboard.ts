@@ -198,6 +198,9 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
   <div class="card">
     <h2>Sessions <span id="sessionCount" style="color:#888;font-size:12px;text-transform:none"></span></h2>
+    <div style="margin-bottom:12px">
+      <input type="text" id="sessionSearch" placeholder="Filter by ID, URL, status..." style="background:#1a1a2e;border:1px solid #333;color:#e0e0e0;padding:6px 10px;border-radius:4px;font-size:13px;font-family:inherit;width:100%">
+    </div>
     <ul class="session-list" id="sessionList">
       <li class="empty">Loading...</li>
     </ul>
@@ -254,43 +257,60 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   }
 
   // ─── Session list ────────────────────────────────────────────────────
+  let allSessions = [];
+
   async function loadSessions() {
     try {
       const res = await fetch(BASE + '/api/sessions');
-      const sessions = await res.json();
-      const list = document.getElementById('sessionList');
-      document.getElementById('sessionCount').textContent = '(' + sessions.length + ')';
-
-      if (sessions.length === 0) {
-        list.innerHTML = '<li class="empty">No capture sessions yet.</li>';
-        return;
-      }
-
-      list.innerHTML = sessions.map(s => {
-        const id = (s.id || '').slice(0, 8);
-        const date = s.startedAt ? new Date(s.startedAt).toLocaleString() : '—';
-        const events = s.eventCount || 0;
-        const frames = s.frameCount || 0;
-        const status = s.status || 'unknown';
-        const statusBadge = status === 'active' ? '<span style="color:#6bdb6b">active</span>'
-          : status === 'abandoned' ? '<span style="color:#888">stale</span>' : '';
-        return '<li class="session-item">' +
-          '<span class="id">' + esc(id) + '</span>' +
-          '<span class="date">' + esc(date) + ' ' + statusBadge + '</span>' +
-          '<span class="stats">' +
-            '<span>' + events + ' events</span>' +
-            '<span>' + frames + ' frames</span>' +
-          '</span>' +
-          '<span class="actions">' +
-            '<button onclick="openReplay(\\'' + esc(s.id) + '\\')">Replay</button>' +
-            '<button class="danger" onclick="deleteSession(\\'' + esc(s.id) + '\\')">Delete</button>' +
-          '</span>' +
-        '</li>';
-      }).join('');
+      allSessions = await res.json();
+      renderSessions();
     } catch {
       document.getElementById('sessionList').innerHTML = '<li class="empty">Failed to load sessions.</li>';
     }
   }
+
+  function renderSessions() {
+    const filter = (document.getElementById('sessionSearch').value || '').toLowerCase();
+    const filtered = filter
+      ? allSessions.filter(s => {
+          const haystack = [s.id, s.status, s.startedAt, s.config?.urlFilter].filter(Boolean).join(' ').toLowerCase();
+          return haystack.includes(filter);
+        })
+      : allSessions;
+
+    const list = document.getElementById('sessionList');
+    document.getElementById('sessionCount').textContent = '(' + filtered.length + (filter ? '/' + allSessions.length : '') + ')';
+
+    if (filtered.length === 0) {
+      list.innerHTML = '<li class="empty">' + (filter ? 'No matching sessions.' : 'No capture sessions yet.') + '</li>';
+      return;
+    }
+
+    list.innerHTML = filtered.map(s => {
+      const id = (s.id || '').slice(0, 8);
+      const date = s.startedAt ? new Date(s.startedAt).toLocaleString() : '—';
+      const events = s.eventCount || 0;
+      const frames = s.frameCount || 0;
+      const status = s.status || 'unknown';
+      const statusBadge = status === 'active' ? '<span style="color:#6bdb6b">active</span>'
+        : status === 'abandoned' ? '<span style="color:#888">stale</span>' : '';
+      return '<li class="session-item">' +
+        '<span class="id">' + esc(id) + '</span>' +
+        '<span class="date">' + esc(date) + ' ' + statusBadge + '</span>' +
+        '<span class="stats">' +
+          '<span>' + events + ' events</span>' +
+          '<span>' + frames + ' frames</span>' +
+        '</span>' +
+        '<span class="actions">' +
+          '<button onclick="openReplay(\\'' + esc(s.id) + '\\')">Replay</button>' +
+          '<button onclick="copyReplayURL(\\'' + esc(s.id) + '\\')">Copy URL</button>' +
+          '<button class="danger" onclick="deleteSession(\\'' + esc(s.id) + '\\')">Delete</button>' +
+        '</span>' +
+      '</li>';
+    }).join('');
+  }
+
+  document.getElementById('sessionSearch').addEventListener('input', renderSessions);
 
   // ─── Actions (exposed globally) ──────────────────────────────────────
   window.startCapture = async function() {
@@ -327,6 +347,10 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
   window.openReplay = function(id) {
     window.open(BASE + '/replay/' + id, '_blank');
+  };
+
+  window.copyReplayURL = function(id) {
+    navigator.clipboard.writeText(BASE + '/replay/' + id).catch(() => {});
   };
 
   window.deleteSession = async function(id) {

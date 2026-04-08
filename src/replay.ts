@@ -266,9 +266,21 @@ body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMac
 .timeline-container {
   flex: 1;
   display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: relative;
+}
+.timeline-row {
+  display: flex;
   align-items: center;
   gap: 8px;
-  position: relative;
+}
+.minimap {
+  width: 100%;
+  height: 16px;
+  border-radius: 3px;
+  background: #222;
+  cursor: pointer;
 }
 .timeline-container input[type=range] {
   flex: 1;
@@ -346,8 +358,13 @@ body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMac
     <button id="playBtn" title="Space">▶</button>
     <button id="speedBtn" class="speed" title="< / >">1x</button>
     <div class="timeline-container">
-      <div class="input-markers" id="inputMarkers"></div>
-      <input type="range" id="timeline" min="0" max="1000" value="0" step="1">
+      <canvas class="minimap" id="minimap"></canvas>
+      <div class="timeline-row">
+        <div style="flex:1;position:relative">
+          <div class="input-markers" id="inputMarkers"></div>
+          <input type="range" id="timeline" min="0" max="1000" value="0" step="1" style="width:100%">
+        </div>
+      </div>
     </div>
     <span class="time-display" id="timeDisplay">0:00.0 / 0:00.0</span>
   </div>
@@ -402,6 +419,7 @@ body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMac
   const $timeline = document.getElementById('timeline');
   const $timeDisplay = document.getElementById('timeDisplay');
   const $inputMarkers = document.getElementById('inputMarkers');
+  const $minimap = document.getElementById('minimap');
 
   const vCtx = $videoCanvas.getContext('2d');
   const cCtx = $clickCanvas.getContext('2d');
@@ -442,7 +460,8 @@ body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMac
     setupUI();
     $loading.style.display = 'none';
     $app.style.display = '';
-    renderAll();
+    // Delay minimap slightly so the DOM has laid out and we get correct dimensions
+    requestAnimationFrame(() => { renderMinimap(); renderAll(); });
   }
 
   // ─── UI setup ───────────────────────────────────────────────────────────
@@ -533,6 +552,75 @@ body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMac
     // tied to the actual frame size for crisp rendering
   }
 
+  function renderMinimap() {
+    const canvas = $minimap;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * 2; // 2x for retina
+    canvas.height = rect.height * 2;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    // Draw event density as colored bars
+    const bucketCount = Math.floor(w / 2);
+    const bucketMs = sessionDuration / bucketCount;
+    const netBuckets = new Float32Array(bucketCount);
+    const inputBuckets = new Float32Array(bucketCount);
+    const consoleBuckets = new Float32Array(bucketCount);
+
+    for (const e of networkEvents) {
+      const bi = Math.min(Math.floor((e.timestamp - sessionStart) / bucketMs), bucketCount - 1);
+      if (bi >= 0) netBuckets[bi]++;
+    }
+    for (const e of inputEvents) {
+      const bi = Math.min(Math.floor((e.timestamp - sessionStart) / bucketMs), bucketCount - 1);
+      if (bi >= 0) inputBuckets[bi]++;
+    }
+    for (const e of consoleEvents) {
+      const bi = Math.min(Math.floor((e.timestamp - sessionStart) / bucketMs), bucketCount - 1);
+      if (bi >= 0) consoleBuckets[bi]++;
+    }
+
+    const maxNet = Math.max(...netBuckets, 1);
+    const maxInput = Math.max(...inputBuckets, 1);
+    const maxConsole = Math.max(...consoleBuckets, 1);
+
+    for (let i = 0; i < bucketCount; i++) {
+      const x = (i / bucketCount) * w;
+      const bw = Math.max(w / bucketCount, 1);
+      // Network: blue, bottom third
+      if (netBuckets[i] > 0) {
+        const bh = (netBuckets[i] / maxNet) * (h / 3);
+        ctx.fillStyle = 'rgba(126, 200, 227, 0.7)';
+        ctx.fillRect(x, h - bh, bw, bh);
+      }
+      // Input: red, middle third
+      if (inputBuckets[i] > 0) {
+        const bh = (inputBuckets[i] / maxInput) * (h / 3);
+        ctx.fillStyle = 'rgba(224, 108, 117, 0.7)';
+        ctx.fillRect(x, h / 3 * 2 - bh, bw, bh);
+      }
+      // Console: yellow, top third
+      if (consoleBuckets[i] > 0) {
+        const bh = (consoleBuckets[i] / maxConsole) * (h / 3);
+        ctx.fillStyle = 'rgba(229, 192, 123, 0.7)';
+        ctx.fillRect(x, h / 3 - bh, bw, bh);
+      }
+    }
+
+    // Cache the density bars so playhead updates are cheap
+    minimapBase = ctx.getImageData(0, 0, w, h);
+  }
+
+  // Allow clicking on minimap to seek
+  $minimap.addEventListener('click', (e) => {
+    const rect = $minimap.getBoundingClientRect();
+    const pct = (e.clientX - rect.left) / rect.width;
+    currentTime = pct * sessionDuration;
+    $timeline.value = Math.round(pct * 1000);
+    renderAll();
+  });
+
   // ─── Playback ───────────────────────────────────────────────────────────
   function togglePlay() {
     playing = !playing;
@@ -618,6 +706,8 @@ body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMac
   }
 
   // ─── Render ─────────────────────────────────────────────────────────────
+  let minimapBase = null; // cached ImageData of the density bars
+
   function renderAll() {
     renderVideo();
     renderClickOverlay();
@@ -625,6 +715,20 @@ body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMac
     renderConsole();
     renderPageState();
     renderTime();
+    renderMinimapPlayhead();
+  }
+
+  function renderMinimapPlayhead() {
+    const canvas = $minimap;
+    const ctx = canvas.getContext('2d');
+    if (!ctx || canvas.width === 0) return;
+    // Restore cached density bars, then draw playhead on top
+    if (minimapBase) {
+      ctx.putImageData(minimapBase, 0, 0);
+    }
+    const x = (currentTime / sessionDuration) * canvas.width;
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.fillRect(Math.floor(x) - 1, 0, 2, canvas.height);
   }
 
   function renderVideo() {

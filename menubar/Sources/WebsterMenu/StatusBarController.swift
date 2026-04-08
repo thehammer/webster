@@ -10,6 +10,7 @@ final class StatusBarController: NSObject {
     // Cached state
     private var serverStatus: ServerStatus?
     private var sessions: [SessionInfo] = []
+    private var thumbnailCache: [String: NSImage] = [:]
 
     // Capture preferences (persisted in UserDefaults)
     private var prefIncludeInput: Bool {
@@ -48,9 +49,29 @@ final class StatusBarController: NSObject {
     private func toggleCapture() {
         let isActive = serverStatus?.capture.active ?? false
         if isActive {
-            stopCapture()
+            Task {
+                let result = await client.stopCapture()
+                await poll()
+                self.sessions = await client.fetchSessions()
+                buildMenu()
+                let events = result?.eventCount ?? 0
+                showNotification(title: "Webster", body: "Capture stopped — \(events) events")
+                if let snap = result, snap.frameCount > 0 {
+                    if let url = self.client.replayURL(sessionId: snap.sessionId) {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
         } else {
-            startCapture()
+            Task {
+                _ = await client.startCapture(
+                    urlFilter: nil,
+                    includeInput: prefIncludeInput,
+                    recordFrames: prefRecordFrames
+                )
+                await poll()
+                showNotification(title: "Webster", body: "Capture started (⌃⌥R to stop)")
+            }
         }
     }
 
@@ -237,12 +258,39 @@ final class StatusBarController: NSObject {
                 let shortId = String(session.id.prefix(8))
                 let events = session.eventCount ?? 0
                 let frames = session.frameCount ?? 0
-                let status = session.status ?? "?"
                 let date = formatDate(session.startedAt)
-                let title = "\(shortId) — \(date) — \(events)ev \(frames)fr (\(status))"
-                let item = NSMenuItem(title: title, action: #selector(openReplay(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = session.id
+                let title = "\(shortId) — \(date) — \(events)ev \(frames)fr"
+
+                // Each session gets a submenu with actions
+                let sessionSubmenu = NSMenu()
+
+                let replayItem = NSMenuItem(title: "Open Replay", action: #selector(openReplay(_:)), keyEquivalent: "")
+                replayItem.target = self
+                replayItem.representedObject = session.id
+                sessionSubmenu.addItem(replayItem)
+
+                let copyItem = NSMenuItem(title: "Copy Replay URL", action: #selector(copyReplayURL(_:)), keyEquivalent: "")
+                copyItem.target = self
+                copyItem.representedObject = session.id
+                sessionSubmenu.addItem(copyItem)
+
+                sessionSubmenu.addItem(.separator())
+
+                let deleteItem = NSMenuItem(title: "Delete", action: #selector(deleteSession(_:)), keyEquivalent: "")
+                deleteItem.target = self
+                deleteItem.representedObject = session.id
+                sessionSubmenu.addItem(deleteItem)
+
+                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                item.submenu = sessionSubmenu
+
+                // Load thumbnail from first frame
+                if frames > 0, let thumb = thumbnailCache[session.id] {
+                    item.image = thumb
+                } else if frames > 0 {
+                    loadThumbnail(sessionId: session.id)
+                }
+
                 sessionsSubmenu.addItem(item)
             }
             let sessionsItem = NSMenuItem(title: "Recent Sessions (\(sessions.count))", action: nil, keyEquivalent: "")
@@ -319,8 +367,65 @@ final class StatusBarController: NSObject {
         }
     }
 
+    @objc private func copyReplayURL(_ sender: NSMenuItem) {
+        guard let sessionId = sender.representedObject as? String else { return }
+        if let url = client.replayURL(sessionId: sessionId) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        }
+    }
+
+    @objc private func deleteSession(_ sender: NSMenuItem) {
+        guard let sessionId = sender.representedObject as? String else { return }
+        Task {
+            _ = await client.deleteSession(id: sessionId)
+            self.sessions = await client.fetchSessions()
+            self.thumbnailCache.removeValue(forKey: sessionId)
+            buildMenu()
+        }
+    }
+
     @objc private func quit() {
         NSApplication.shared.terminate(nil)
+    }
+
+    // MARK: - Thumbnails
+
+    private func loadThumbnail(sessionId: String) {
+        guard let url = client.replayURL(sessionId: sessionId) else { return }
+        // Derive frame URL from replay URL
+        let frameURL = URL(string: url.absoluteString + "/frame/frame_00001.jpg")!
+        Task.detached(priority: .background) {
+            do {
+                let (data, _) = try await URLSession.shared.data(from: frameURL)
+                guard let fullImage = NSImage(data: data) else { return }
+                // Scale to menu bar thumbnail size (24px tall)
+                let thumbHeight: CGFloat = 24
+                let aspect = fullImage.size.width / fullImage.size.height
+                let thumbSize = NSSize(width: thumbHeight * aspect, height: thumbHeight)
+                let thumb = NSImage(size: thumbSize, flipped: false) { rect in
+                    fullImage.draw(in: rect)
+                    return true
+                }
+                await MainActor.run {
+                    self.thumbnailCache[sessionId] = thumb
+                    self.buildMenu()
+                }
+            } catch { /* skip thumbnail */ }
+        }
+    }
+
+    // MARK: - Notifications
+
+    private func showNotification(title: String, body: String) {
+        // Flash the menu bar icon briefly as visual feedback
+        guard let button = statusItem.button else { return }
+        let original = button.title
+        button.title = "  \(body)"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            button.title = original
+            self?.updateIcon()
+        }
     }
 
     // MARK: - Helpers
