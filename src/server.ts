@@ -1,7 +1,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
-import { isResult, type WsCommand, type WsMessage } from './protocol.js'
+import { isResult, isCaptureEvent, isCaptureDone, type WsCommand, type WsMessage } from './protocol.js'
+import { CaptureSession, cleanOldSessions, type CaptureConfig, type CaptureEvent } from './capture.js'
 
 // ─── Registry ─────────────────────────────────────────────────────────────────
 // Each Webster server process registers itself so concurrent sessions can
@@ -70,8 +71,12 @@ export class WebsterServer {
   // Tab ownership — soft advisory locking for concurrent Claude sessions
   private tabOwnership = new Map<number, string>() // tabId → 'port:pid'
 
+  // Active capture session — receives push events from extension
+  private captureSession: CaptureSession | null = null
+
   constructor(port: number, commandTimeout = 30000) {
     this.commandTimeout = commandTimeout
+    cleanOldSessions()
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     this.server = (Bun.serve as any)({
@@ -196,6 +201,12 @@ export class WebsterServer {
   }
 
   private handleHttpResult(msg: WsMessage) {
+    // Capture push events via HTTP (Safari path)
+    if (isCaptureEvent(msg) || isCaptureDone(msg)) {
+      this.handleCaptureEvent(msg)
+      return
+    }
+
     if (!isResult(msg)) return
 
     const handler = this.httpResultHandlers.get(msg.id)
@@ -238,6 +249,12 @@ export class WebsterServer {
       msg = JSON.parse(typeof data === 'string' ? data : data.toString())
     } catch {
       console.error('Webster: failed to parse message', data)
+      return
+    }
+
+    // Capture push events — extension streaming data to server
+    if (isCaptureEvent(msg) || isCaptureDone(msg)) {
+      this.handleCaptureEvent(msg)
       return
     }
 
@@ -410,7 +427,59 @@ export class WebsterServer {
     return [...this.tabOwnership.entries()].map(([tabId, owner]) => ({ tabId, owner }))
   }
 
+  // ─── Capture session management ───────────────────────────────────────
+
+  startCaptureSession(config: CaptureConfig): CaptureSession {
+    // Stop any existing session
+    if (this.captureSession?.active) {
+      this.captureSession.finalize()
+    }
+    const id = crypto.randomUUID() as string
+    this.captureSession = new CaptureSession(id, config)
+    return this.captureSession
+  }
+
+  getCaptureSession(): CaptureSession | null {
+    return this.captureSession
+  }
+
+  stopCaptureSession(): CaptureSession | null {
+    const session = this.captureSession
+    if (session?.active) {
+      session.finalize()
+    }
+    return session
+  }
+
+  private handleCaptureEvent(msg: WsMessage): void {
+    if (!this.captureSession?.active) return
+
+    if (isCaptureEvent(msg)) {
+      if (msg.kind === 'frame') {
+        // Frame data arrives as base64 JPEG — decode and write to disk
+        const base64 = (msg.data.jpeg as string) || ''
+        if (base64) {
+          const buffer = Buffer.from(base64, 'base64')
+          this.captureSession.appendFrame(buffer)
+        }
+      } else {
+        // Network or input event — append as-is
+        const event: CaptureEvent = {
+          kind: msg.kind,
+          timestamp: (msg.data.timestamp as number) || Date.now(),
+          ...msg.data,
+        }
+        this.captureSession.appendEvent(event)
+      }
+    } else if (isCaptureDone(msg)) {
+      this.captureSession.finalize()
+    }
+  }
+
   close(): void {
+    if (this.captureSession?.active) {
+      this.captureSession.finalize()
+    }
     this.deregisterSelf()
     this.server.stop(true)
   }

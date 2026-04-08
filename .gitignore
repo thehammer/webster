@@ -4,3 +4,4 @@ dist/
 *.local
 build/
 .DS_Store
+.claude/SESSION_NOTES.md

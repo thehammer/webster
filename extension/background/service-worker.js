@@ -231,5 +231,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true
 })
 
+/**
+ * Push an unsolicited message to the primary server (capture events, etc).
+ * Returns true if the message was sent, false if no connection is available.
+ */
+export function pushToServer(msg) {
+  // Send to the primary port connection
+  for (const [, conn] of connections) {
+    if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+      conn.ws.send(JSON.stringify(msg))
+      return true
+    }
+  }
+  return false
+}
+
 // Start connecting to all configured servers when service worker loads
 connectAll()

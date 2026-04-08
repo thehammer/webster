@@ -138,3 +138,89 @@ describe('WebsterServer', () => {
     ws.close()
   })
 })
+
+describe('capture push events', () => {
+  test('routes capture_event messages to active session', async () => {
+    const port = await findFreePort()
+    const server = new WebsterServer(port, 2000)
+    const ws = await connectAndHandshake(port)
+
+    // Start a capture session on the server
+    const session = server.startCaptureSession({ urlFilter: null })
+
+    // Extension pushes a network event
+    ws.send(JSON.stringify({
+      type: 'capture_event',
+      kind: 'network',
+      data: { url: 'https://example.com/api', method: 'GET', status: 200, timestamp: Date.now() },
+    }))
+    await new Promise(r => setTimeout(r, 50))
+
+    const snap = session.getSnapshot()
+    expect(snap.eventCount).toBe(1)
+    expect(snap.breakdown.network).toBe(1)
+
+    session.cleanup()
+    ws.close()
+    server.close()
+  })
+
+  test('routes frame events to session as JPEG files', async () => {
+    const port = await findFreePort()
+    const server = new WebsterServer(port, 2000)
+    const ws = await connectAndHandshake(port)
+
+    const session = server.startCaptureSession({ recordFrames: true })
+
+    // Push a fake frame (base64-encoded bytes)
+    const fakeJpeg = Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]).toString('base64')
+    ws.send(JSON.stringify({
+      type: 'capture_event',
+      kind: 'frame',
+      data: { jpeg: fakeJpeg },
+    }))
+    await new Promise(r => setTimeout(r, 50))
+
+    expect(session.getSnapshot().frameCount).toBe(1)
+
+    session.cleanup()
+    ws.close()
+    server.close()
+  })
+
+  test('capture_done finalizes the session', async () => {
+    const port = await findFreePort()
+    const server = new WebsterServer(port, 2000)
+    const ws = await connectAndHandshake(port)
+
+    const session = server.startCaptureSession({})
+
+    ws.send(JSON.stringify({ type: 'capture_done' }))
+    await new Promise(r => setTimeout(r, 50))
+
+    expect(session.active).toBe(false)
+
+    session.cleanup()
+    ws.close()
+    server.close()
+  })
+
+  test('ignores capture events when no active session', async () => {
+    const port = await findFreePort()
+    const server = new WebsterServer(port, 2000)
+    const ws = await connectAndHandshake(port)
+
+    // No session started — should not throw
+    ws.send(JSON.stringify({
+      type: 'capture_event',
+      kind: 'network',
+      data: { url: 'https://example.com', timestamp: Date.now() },
+    }))
+    await new Promise(r => setTimeout(r, 50))
+
+    expect(server.getCaptureSession()).toBeNull()
+
+    ws.close()
+    server.close()
+  })
+})

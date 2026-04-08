@@ -2,6 +2,10 @@ import { describe, test, expect } from 'bun:test'
 import { createTools } from '../tools.js'
 import type { WebsterServer } from '../server.js'
 
+import { CaptureSession } from '../capture.js'
+
+const mockSession = new CaptureSession('test-tools', { urlFilter: null })
+
 const mockServer = {
   dispatch: async (_cmd: Record<string, unknown>) => ({ success: true }),
   isConnected: () => true,
@@ -9,6 +13,9 @@ const mockServer = {
   setBrowser: (_idOrName: string) => ({ id: 'test', browser: 'chrome', version: '1.0', transport: 'ws', active: true }),
   claimTab: (_tabId: number | undefined) => ({ claimed: true, tabId: 1, owner: '3456:1234' }),
   releaseTab: (_tabId: number | undefined) => undefined,
+  startCaptureSession: () => mockSession,
+  getCaptureSession: () => mockSession,
+  stopCaptureSession: () => mockSession,
 } as unknown as WebsterServer
 
 const tools = createTools(mockServer)
@@ -44,12 +51,10 @@ const EXPECTED_TOOL_NAMES = [
   'set_browser',
   'upload_file',
   'resize_window',
-  'start_recording',
-  'stop_recording',
-  'export_gif',
   'start_capture',
   'stop_capture',
   'get_capture',
+  'export_video',
   // Phase 10 — input dispatching & monitoring
   'hover',
   'drag',
@@ -61,12 +66,12 @@ const EXPECTED_TOOL_NAMES = [
 ]
 
 describe('createTools', () => {
-  test('all 42 tools are present by name', () => {
+  test('all 40 tools are present by name', () => {
     const names = tools.map(t => t.name)
     for (const expected of EXPECTED_TOOL_NAMES) {
       expect(names).toContain(expected)
     }
-    expect(tools).toHaveLength(42)
+    expect(tools).toHaveLength(40)
   })
 
   test('all tools have description and inputSchema', () => {

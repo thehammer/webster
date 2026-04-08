@@ -1,5 +1,6 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js'
 import type { WebsterServer } from './server.js'
+import type { VideoFormat } from './video.js'
 
 interface WebsterTool extends Tool {
   execute(input: Record<string, unknown>): Promise<unknown>
@@ -425,91 +426,123 @@ export function createTools(server: WebsterServer): WebsterTool[] {
     },
 
     {
-      name: 'start_recording',
-      description: 'Start recording browser frames for GIF export. Captures screenshots at the specified FPS. Call stop_recording or export_gif when done.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          fps: { type: 'number', description: 'Frames per second (default: 2)' },
-          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
-        },
-      },
-      execute: (input) => dispatch('startRecording', input),
-    },
-
-    {
-      name: 'stop_recording',
-      description: 'Stop recording and return the captured frames as base64 PNG data URLs.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
-        },
-      },
-      execute: (input) => dispatch('stopRecording', input),
-    },
-
-    {
-      name: 'export_gif',
-      description: 'Stop recording and export the captured frames as an animated GIF. Returns a base64 data URL of the GIF. Uses ffmpeg if available, pure-JS encoder otherwise.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          fps: { type: 'number', description: 'Frames per second for the GIF (default: 2)' },
-          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
-        },
-      },
-      execute: async (input) => {
-        const result = await dispatch('stopRecording', input) as { frames: { dataUrl: string; timestamp: number }[] }
-        if (!result?.frames?.length) throw new Error('No frames recorded')
-        const { encodeGif } = await import('./gif.js')
-        return encodeGif(result.frames, (input as { fps?: number }).fps ?? 2)
-      },
-    },
-
-    {
       name: 'start_capture',
-      description: 'Start deep capture using Chrome Debugger Protocol. Captures FULL network request/response bodies, headers, and timing across ALL windows including popups. With includeInput, also captures mouse and keyboard events for a unified time-series. With recordGif, captures screenshots for an animated GIF. Use stop_capture to finish and retrieve data.',
+      description: 'Start deep capture using Chrome Debugger Protocol. Captures FULL network request/response bodies, headers, and timing across ALL windows including popups. Capture data streams to the server in real-time — resilient to browser extension restarts. Use stop_capture to finish, get_capture to read data.',
       inputSchema: {
         type: 'object',
         properties: {
           urlFilter: { type: 'string', description: 'Only capture requests where URL contains this string (e.g. "extendedcare.com"). Omit to capture everything.' },
-          includeInput: { type: 'boolean', description: 'Also capture mouse and keyboard events (clicks, moves, keypresses) alongside network traffic. All events returned in a time-sorted array with "kind" field ("network" or "input").' },
-          recordGif: { type: 'boolean', description: 'Also record screenshots for GIF export. stop_capture will return frames alongside events, and encode a GIF if gifFps is set.' },
-          gifFps: { type: 'number', description: 'Frames per second for GIF recording (default: 2). Only used when recordGif is true.' },
+          includeInput: { type: 'boolean', description: 'Also capture mouse and keyboard events (clicks, moves, keypresses) alongside network traffic.' },
+          recordFrames: { type: 'boolean', description: 'Also record screenshots for video/GIF export. Frames stream to server and are stored on disk.' },
+          fps: { type: 'number', description: 'Frames per second for recording (default: 2). Only used when recordFrames is true.' },
         },
       },
-      execute: (input) => dispatch('startCapture', input, CAPTURE_TIMEOUT),
+      execute: async (input) => {
+        const config = {
+          urlFilter: (input.urlFilter as string) || null,
+          includeInput: !!input.includeInput,
+          recordFrames: !!input.recordFrames,
+          fps: (input.fps as number) || 2,
+        }
+
+        // Create server-side session BEFORE telling the extension to start
+        const session = server.startCaptureSession(config)
+
+        // Tell extension to start capture + streaming
+        await dispatch('startCapture', {
+          ...input,
+          // Signal to extension: stream events to server instead of buffering
+          streamToServer: true,
+        }, CAPTURE_TIMEOUT)
+
+        return session.getSnapshot()
+      },
     },
 
     {
       name: 'stop_capture',
-      description: 'Stop capture and return all data. Returns { events: [...], gif?: "data:image/gif;base64,..." }. Events are time-sorted with "kind" field ("network" or "input"). GIF is included only if recordGif was set on start_capture.',
+      description: 'Stop capture session. Returns a summary with sessionId — use get_capture to read events, or export_video for recordings.',
       inputSchema: {
         type: 'object',
-        properties: {
-          gifFps: { type: 'number', description: 'Override GIF FPS for encoding (default: 2). Only relevant if recordGif was enabled.' },
-        },
+        properties: {},
       },
-      execute: async (input) => {
-        const result = await dispatch('stopCapture', {}, CAPTURE_TIMEOUT) as { events: unknown[]; frames?: { dataUrl: string; timestamp: number }[] }
-        if (result?.frames?.length) {
-          const { encodeGif } = await import('./gif.js')
-          const gif = await encodeGif(result.frames, (input as { gifFps?: number }).gifFps ?? 2)
-          return { events: result.events, gif }
-        }
-        return result
+      execute: async () => {
+        // Tell extension to stop (lightweight — no data returned)
+        await dispatch('stopCapture', {}, CAPTURE_TIMEOUT)
+
+        // Finalize server-side session
+        const session = server.stopCaptureSession()
+        if (!session) throw new Error('No active capture session')
+        return session.getSnapshot()
       },
     },
 
     {
       name: 'get_capture',
-      description: 'Peek at captured data without stopping. Returns current events (time-sorted, with "kind" field) and count of pending in-flight requests.',
+      description: 'Read capture data from the server. Returns a summary by default. Use parameters to drill into specific events or filter by URL. Data is read from the server — no round-trip to the browser extension.',
       inputSchema: {
         type: 'object',
-        properties: {},
+        properties: {
+          events: { type: 'boolean', description: 'Include the full event list (default: false, returns summary only)' },
+          kind: { type: 'string', enum: ['network', 'input'], description: 'Filter events by kind' },
+          urlFilter: { type: 'string', description: 'Filter network events by URL substring' },
+          event: { type: 'number', description: 'Return a single event by index (0-based)' },
+          offset: { type: 'number', description: 'Skip first N events (for pagination)' },
+          limit: { type: 'number', description: 'Max events to return (for pagination)' },
+        },
       },
-      execute: () => dispatch('getCapture', {}, CAPTURE_TIMEOUT),
+      execute: async (input) => {
+        const session = server.getCaptureSession()
+        if (!session) throw new Error('No capture session — call start_capture first')
+
+        // Single event by index
+        if (input.event != null) {
+          const event = session.readEvent(input.event as number)
+          if (!event) throw new Error(`Event ${input.event} not found`)
+          return event
+        }
+
+        // Full event list with optional filters
+        if (input.events) {
+          return session.readEvents({
+            kind: input.kind as 'network' | 'input' | undefined,
+            urlFilter: input.urlFilter as string | undefined,
+            offset: input.offset as number | undefined,
+            limit: input.limit as number | undefined,
+          })
+        }
+
+        // Default: summary only
+        return session.getSnapshot()
+      },
+    },
+
+    {
+      name: 'export_video',
+      description: 'Encode captured frames into a video file. Requires recordFrames on start_capture. Returns the file path. Supports mp4, webm, and gif formats.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          format: { type: 'string', enum: ['mp4', 'webm', 'gif'], description: 'Video format (default: mp4)' },
+          fps: { type: 'number', description: 'Frames per second (default: 2)' },
+        },
+      },
+      execute: async (input) => {
+        const session = server.getCaptureSession()
+        if (!session) throw new Error('No capture session')
+
+        const snap = session.getSnapshot()
+        if (snap.frameCount === 0) throw new Error('No frames recorded — did you set recordFrames: true on start_capture?')
+
+        const { encodeVideo } = await import('./video.js')
+        const outPath = await encodeVideo(session.framesDir, {
+          format: (input.format as VideoFormat) || 'mp4',
+          fps: (input.fps as number) || snap.config.fps || 2,
+          outDir: session.dir,
+        })
+
+        return { path: outPath, format: input.format || 'mp4', frames: snap.frameCount }
+      },
     },
 
     {

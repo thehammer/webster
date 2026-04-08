@@ -4,16 +4,17 @@
 //
 // All handlers return { success: boolean, data?: unknown, error?: string }
 
+import { pushToServer } from './service-worker.js'
+
 // Network request ring buffer (populated by webRequest API)
 const networkLog = []
 const MAX_NETWORK_LOG = 500
 
 // ─── Deep capture state (Chrome Debugger API) ──────────────────────────────
 // Captures full request/response bodies across ALL windows including popups.
-// Optionally captures input events (mouse + keyboard) for a unified time-series.
-// Use startCapture/stopCapture/getCapture actions to control.
+// Events stream to the server in real-time via pushToServer() — the extension
+// does NOT buffer capture data. This makes capture resilient to SW restarts.
 let captureActive = false
-let captureBuffer = []           // completed request/response pairs + input events
 let capturePending = new Map()   // requestId -> partial entry (waiting for response body)
 let capturedTabs = new Set()     // tabIds with debugger attached
 let captureUrlFilter = null      // only capture URLs containing this string
@@ -23,7 +24,6 @@ let captureStartWallMs = 0       // Date.now() at capture start — used to conv
 let captureStartMonotonic = 0    // first CDP timestamp seen — used with captureStartWallMs for conversion
 let captureMonotonicCalibrated = false
 const MAX_CAPTURE_BODY = 512000  // 500KB max per response body
-const MAX_CAPTURE_ENTRIES = 2000
 const INPUT_DRAIN_INTERVAL_MS = 2000
 
 function matchesCaptureFilter(url) {
@@ -131,7 +131,8 @@ function handleDebuggerEvent(source, method, params) {
     const { request, type, timestamp, redirectResponse } = params
     if (!matchesCaptureFilter(request.url)) return
 
-    // If this is a redirect, finalize the redirect entry
+    // If this is a redirect, stream the redirect entry to server (don't use finalizeEntry
+    // — it deletes the key, but we're about to set a new pending entry for the same key)
     if (redirectResponse && capturePending.has(key)) {
       const prev = capturePending.get(key)
       prev.status = redirectResponse.status
@@ -141,8 +142,11 @@ function handleDebuggerEvent(source, method, params) {
       prev.endTime = timestamp
       prev.duration = Math.round((timestamp - prev._startTimestamp) * 1000)
       prev.redirectedTo = request.url
-      captureBuffer.push(prev)
-      if (captureBuffer.length > MAX_CAPTURE_ENTRIES) captureBuffer.shift()
+      prev.kind = 'network'
+      prev.timestamp = cdpTimestampToEpochMs(prev._startTimestamp)
+      delete prev._startTimestamp
+      delete prev._requestId
+      pushToServer({ type: 'capture_event', kind: 'network', data: prev })
     }
 
     capturePending.set(key, {
@@ -221,16 +225,18 @@ function handleDebuggerEvent(source, method, params) {
 
 function finalizeEntry(key, entry) {
   capturePending.delete(key)
-  // Convert _startTimestamp (CDP monotonic) to wall-clock epoch ms for sorting
-  entry._ts = cdpTimestampToEpochMs(entry._startTimestamp)
+  // Convert _startTimestamp (CDP monotonic) to wall-clock epoch ms
+  const timestamp = cdpTimestampToEpochMs(entry._startTimestamp)
   delete entry._startTimestamp
   delete entry._requestId
   entry.kind = 'network'
-  captureBuffer.push(entry)
-  if (captureBuffer.length > MAX_CAPTURE_ENTRIES) captureBuffer.shift()
+  entry.timestamp = timestamp
+
+  // Stream to server immediately — no local buffering
+  pushToServer({ type: 'capture_event', kind: 'network', data: entry })
 }
 
-// Drain input events from all captured tabs into the capture buffer.
+// Drain input events from all captured tabs and stream them to the server.
 // Each tab gets a 1.5s budget — if the content script doesn't respond, skip it.
 async function drainInputEvents() {
   if (!captureInputEnabled || !captureActive) return
@@ -243,19 +249,21 @@ async function drainInputEvents() {
       )
       if (result?.success && Array.isArray(result.data)) {
         for (const evt of result.data) {
-          captureBuffer.push({
+          pushToServer({
+            type: 'capture_event',
             kind: 'input',
-            tabId,
-            inputType: evt.type,
-            x: evt.x,
-            y: evt.y,
-            key: evt.key,
-            button: evt.button,
-            modifiers: evt.modifiers,
-            _ts: evt.t,
-            time: new Date(evt.t).toISOString(),
+            data: {
+              tabId,
+              inputType: evt.type,
+              x: evt.x,
+              y: evt.y,
+              key: evt.key,
+              button: evt.button,
+              modifiers: evt.modifiers,
+              timestamp: evt.t,
+              time: new Date(evt.t).toISOString(),
+            },
           })
-          if (captureBuffer.length > MAX_CAPTURE_ENTRIES) captureBuffer.shift()
         }
       }
     } catch {
@@ -267,9 +275,20 @@ async function drainInputEvents() {
 function startInputDraining() {
   stopInputDraining()
   captureInputEnabled = true
-  // Don't use setInterval — periodic drains crash the MV3 service worker.
-  // Input events accumulate in page-script buffers and are drained on
-  // get_capture / stop_capture instead.
+  // With streaming, we CAN use periodic draining — events push to the server
+  // immediately, so even if the SW restarts, data already sent is safe.
+  // Use self-scheduling setTimeout chain (not setInterval) for MV3 safety.
+  function drainLoop() {
+    if (!captureInputEnabled || !captureActive) return
+    drainInputEvents()
+      .catch(() => {})
+      .finally(() => {
+        if (captureInputEnabled && captureActive) {
+          captureInputInterval = setTimeout(drainLoop, INPUT_DRAIN_INTERVAL_MS)
+        }
+      })
+  }
+  captureInputInterval = setTimeout(drainLoop, INPUT_DRAIN_INTERVAL_MS)
 }
 
 function stopInputDraining() {
@@ -833,7 +852,6 @@ export async function executeCommand(command) {
         }
 
         captureActive = true
-        captureBuffer = []
         capturePending = new Map()
         capturedTabs = new Set()
         captureUrlFilter = command.urlFilter || null
@@ -881,22 +899,23 @@ export async function executeCommand(command) {
           startInputDraining()
         }
 
-        // Start GIF recording if requested.
-        // Uses a self-scheduling setTimeout chain instead of setInterval —
-        // setInterval with async callbacks crashes MV3 service workers.
-        if (command.recordGif) {
+        // Start frame recording if requested — stream frames to server immediately.
+        // Uses a self-scheduling setTimeout chain (not setInterval) for MV3 safety.
+        if (command.recordFrames) {
           const tab = await getTargetTab(command.tabId)
           if (tab) {
             recordingTabId = tab.id
             recordingFrames = []
             recordingActive = true
-            const intervalMs = Math.round(1000 / (command.gifFps || 2))
+            const intervalMs = Math.round(1000 / (command.fps || 2))
             if (recordingInterval) clearTimeout(recordingInterval)
             function captureFrame() {
               if (!recordingActive) return
               chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 30 })
                 .then((dataUrl) => {
-                  recordingFrames.push({ dataUrl, timestamp: Date.now() })
+                  // Strip data URL prefix and stream raw base64 to server
+                  const base64 = dataUrl.replace(/^data:image\/\w+;base64,/, '')
+                  pushToServer({ type: 'capture_event', kind: 'frame', data: { jpeg: base64 } })
                 })
                 .catch(() => { /* tab may have navigated, skip frame */ })
                 .finally(() => {
@@ -909,12 +928,12 @@ export async function executeCommand(command) {
           }
         }
 
-        return { success: true, data: { tabsAttached: capturedTabs.size, urlFilter: captureUrlFilter, includeInput: !!command.includeInput, recordGif: !!command.recordGif } }
+        return { success: true, data: { tabsAttached: capturedTabs.size, urlFilter: captureUrlFilter, includeInput: !!command.includeInput, recordFrames: !!command.recordFrames } }
       }
 
       case 'stopCapture': {
-        // ZERO awaits in this handler — MV3 service workers die at any await point.
-        // Input events accumulated in the buffer during the capture session are included as-is.
+        // Lightweight stop — all data already streamed to server.
+        // No more zero-await constraint since we don't return data.
         stopInputDraining()
         captureActive = false
         chrome.tabs.onCreated.removeListener(onCaptureTabCreated)
@@ -922,55 +941,38 @@ export async function executeCommand(command) {
           chrome.webNavigation.onBeforeNavigate.removeListener(onCaptureNavigation)
         }
 
-        // Stop GIF recording
-        let frames = null
+        // Stop frame recording
         if (recordingActive) {
-          if (recordingInterval) { clearInterval(recordingInterval); recordingInterval = null }
+          if (recordingInterval) { clearTimeout(recordingInterval); recordingInterval = null }
           recordingActive = false
-          frames = recordingFrames.slice()
           recordingFrames = []
         }
 
-        // Flush any remaining pending entries (incomplete requests)
-        for (const [, entry] of capturePending) {
-          entry._ts = cdpTimestampToEpochMs(entry._startTimestamp)
+        // Flush remaining pending entries (incomplete requests) to server
+        for (const [key, entry] of capturePending) {
+          entry.kind = 'network'
+          entry.timestamp = cdpTimestampToEpochMs(entry._startTimestamp)
           delete entry._startTimestamp
           delete entry._requestId
-          entry.kind = 'network'
           entry.responseBody = entry.responseBody || '[incomplete — capture stopped]'
-          captureBuffer.push(entry)
+          pushToServer({ type: 'capture_event', kind: 'network', data: entry })
         }
         capturePending.clear()
 
-        // Sort by timestamp for unified time-series
-        const result = [...captureBuffer].sort((a, b) => (a._ts || 0) - (b._ts || 0))
-        result.forEach(e => delete e._ts)
-        captureBuffer = []
+        // Signal server that capture is done
+        pushToServer({ type: 'capture_done' })
 
-        const response = { events: result }
-        if (frames) response.frames = frames
-
-        // Schedule debugger detach for after the response is sent back over WS.
-        // Using setTimeout ensures the WS send completes before we touch the debugger.
+        // Detach debuggers — can now safely await since we don't return data
         const tabsToDetach = [...capturedTabs]
         capturedTabs.clear()
-        setTimeout(() => {
-          Promise.allSettled(tabsToDetach.map(tabId => detachDebuggerFromTab(tabId))).catch(() => {})
-        }, 100)
+        await Promise.allSettled(tabsToDetach.map(tabId => detachDebuggerFromTab(tabId)))
 
-        return { success: true, data: response }
+        return { success: true, data: { stopped: true } }
       }
 
       case 'getCapture': {
-        // Drain input events before peeking
-        if (captureInputEnabled) {
-          await drainInputEvents()
-        }
-        // Sort by timestamp for unified time-series
-        const sorted = [...captureBuffer].sort((a, b) => (a._ts || 0) - (b._ts || 0))
-        const snapshot = sorted.map(e => { const copy = { ...e }; delete copy._ts; return copy })
-        const pending = capturePending.size
-        return { success: true, data: { entries: snapshot, pendingRequests: pending, active: captureActive, includeInput: captureInputEnabled } }
+        // Server has all the data — just report extension-side status
+        return { success: true, data: { active: captureActive, pendingRequests: capturePending.size, tabsAttached: capturedTabs.size } }
       }
 
       case 'resizeWindow': {
