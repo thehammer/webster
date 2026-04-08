@@ -1,8 +1,18 @@
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, test, expect, beforeAll, beforeEach, afterEach } from 'bun:test'
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { encodeVideo, encodeVideoToDataUrl } from '../video.js'
+
+// Skip all video tests if ffmpeg is not available (e.g. CI)
+let hasFfmpeg = false
+beforeAll(async () => {
+  try {
+    const proc = Bun.spawn(['ffmpeg', '-version'], { stderr: 'pipe', stdout: 'pipe' })
+    await proc.exited
+    hasFfmpeg = proc.exitCode === 0
+  } catch { hasFfmpeg = false }
+})
 
 const testDir = join(tmpdir(), `webster-video-test-${Date.now()}`)
 const framesDir = join(testDir, 'frames')
@@ -23,6 +33,7 @@ async function generateTestFrames(count: number): Promise<void> {
 }
 
 beforeEach(async () => {
+  if (!hasFfmpeg) return
   await generateTestFrames(4)
 })
 
@@ -32,29 +43,34 @@ afterEach(() => {
 
 describe('encodeVideo', () => {
   test('encodes frames to mp4', async () => {
+    if (!hasFfmpeg) return
     const outPath = await encodeVideo(framesDir, { format: 'mp4', fps: 2, outDir: testDir })
     expect(outPath).toEndWith('.mp4')
     expect(existsSync(outPath)).toBe(true)
   })
 
   test('encodes frames to webm', async () => {
+    if (!hasFfmpeg) return
     const outPath = await encodeVideo(framesDir, { format: 'webm', fps: 2, outDir: testDir })
     expect(outPath).toEndWith('.webm')
     expect(existsSync(outPath)).toBe(true)
   })
 
   test('encodes frames to gif', async () => {
+    if (!hasFfmpeg) return
     const outPath = await encodeVideo(framesDir, { format: 'gif', fps: 2, outDir: testDir })
     expect(outPath).toEndWith('.gif')
     expect(existsSync(outPath)).toBe(true)
   })
 
   test('defaults to mp4 format', async () => {
+    if (!hasFfmpeg) return
     const outPath = await encodeVideo(framesDir, { outDir: testDir })
     expect(outPath).toEndWith('.mp4')
   })
 
   test('throws on empty frames directory', async () => {
+    if (!hasFfmpeg) return
     const emptyDir = join(testDir, 'empty')
     mkdirSync(emptyDir, { recursive: true })
     await expect(encodeVideo(emptyDir)).rejects.toThrow('No JPEG frames found')
@@ -63,11 +79,13 @@ describe('encodeVideo', () => {
 
 describe('encodeVideoToDataUrl', () => {
   test('returns a base64 data URL', async () => {
+    if (!hasFfmpeg) return
     const dataUrl = await encodeVideoToDataUrl(framesDir, { format: 'mp4', fps: 2 })
     expect(dataUrl).toStartWith('data:video/mp4;base64,')
   })
 
   test('gif data URL has correct mime type', async () => {
+    if (!hasFfmpeg) return
     const dataUrl = await encodeVideoToDataUrl(framesDir, { format: 'gif', fps: 2 })
     expect(dataUrl).toStartWith('data:image/gif;base64,')
   })
