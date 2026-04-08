@@ -2,7 +2,8 @@ import { mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 import { isResult, isCaptureEvent, isCaptureDone, type WsCommand, type WsMessage } from './protocol.js'
-import { CaptureSession, cleanOldSessions, type CaptureConfig, type CaptureEvent } from './capture.js'
+import { CaptureSession, cleanOldSessions, CAPTURES_DIR, type CaptureConfig, type CaptureEvent } from './capture.js'
+import { handleReplayRequest } from './replay.js'
 
 // ─── Registry ─────────────────────────────────────────────────────────────────
 // Each Webster server process registers itself so concurrent sessions can
@@ -193,6 +194,11 @@ export class WebsterServer {
     if (req.method === 'GET' && url.pathname === '/registry') {
       const entries = readRegistry().filter(e => isProcessAlive(e.pid))
       return Response.json(entries)
+    }
+
+    // Replay viewer
+    if (url.pathname.startsWith('/replay/')) {
+      return handleReplayRequest(req, CAPTURES_DIR)
     }
 
     // Attempt WebSocket upgrade for all other requests

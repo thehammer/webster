@@ -26,11 +26,12 @@ export interface CaptureSnapshot {
   breakdown: { network: number; input: number; console: number; page: number }
   topUrls: string[]
   config: CaptureConfig
+  replayUrl: string
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const CAPTURES_DIR = join(homedir(), '.webster', 'captures')
+export const CAPTURES_DIR = join(homedir(), '.webster', 'captures')
 const MAX_AGE_MS = 24 * 60 * 60 * 1000 // 24 hours
 
 // ─── Session ──────────────────────────────────────────────────────────────────
@@ -129,6 +130,7 @@ export class CaptureSession {
       .slice(0, 10)
       .map(([url, count]) => count > 1 ? `${url} (${count}x)` : url)
 
+    const port = Number(process.env.WEBSTER_PORT ?? 3456)
     return {
       sessionId: this.id,
       active: this._active,
@@ -138,6 +140,7 @@ export class CaptureSession {
       breakdown: { network: this.networkCount, input: this.inputCount, console: this.consoleCount, page: this.pageCount },
       topUrls,
       config: this.config,
+      replayUrl: `http://localhost:${port}/replay/${this.id}`,
     }
   }
 
