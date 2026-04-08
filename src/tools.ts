@@ -467,11 +467,14 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'start_capture',
-      description: 'Start deep network capture using Chrome Debugger Protocol. Captures FULL request/response bodies, headers, and timing across ALL windows including popups. Shows a "debugging" infobar on captured tabs. Use stop_capture to finish and retrieve data.',
+      description: 'Start deep capture using Chrome Debugger Protocol. Captures FULL network request/response bodies, headers, and timing across ALL windows including popups. With includeInput, also captures mouse and keyboard events for a unified time-series. With recordGif, captures screenshots for an animated GIF. Use stop_capture to finish and retrieve data.',
       inputSchema: {
         type: 'object',
         properties: {
           urlFilter: { type: 'string', description: 'Only capture requests where URL contains this string (e.g. "extendedcare.com"). Omit to capture everything.' },
+          includeInput: { type: 'boolean', description: 'Also capture mouse and keyboard events (clicks, moves, keypresses) alongside network traffic. All events returned in a time-sorted array with "kind" field ("network" or "input").' },
+          recordGif: { type: 'boolean', description: 'Also record screenshots for GIF export. stop_capture will return frames alongside events, and encode a GIF if gifFps is set.' },
+          gifFps: { type: 'number', description: 'Frames per second for GIF recording (default: 2). Only used when recordGif is true.' },
         },
       },
       execute: (input) => dispatch('startCapture', input),
@@ -479,17 +482,27 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'stop_capture',
-      description: 'Stop deep network capture and return all captured request/response data. Detaches debugger from all tabs.',
+      description: 'Stop capture and return all data. Returns { events: [...], gif?: "data:image/gif;base64,..." }. Events are time-sorted with "kind" field ("network" or "input"). GIF is included only if recordGif was set on start_capture.',
       inputSchema: {
         type: 'object',
-        properties: {},
+        properties: {
+          gifFps: { type: 'number', description: 'Override GIF FPS for encoding (default: 2). Only relevant if recordGif was enabled.' },
+        },
       },
-      execute: () => dispatch('stopCapture'),
+      execute: async (input) => {
+        const result = await dispatch('stopCapture') as { events: unknown[]; frames?: { dataUrl: string; timestamp: number }[] }
+        if (result?.frames?.length) {
+          const { encodeGif } = await import('./gif.js')
+          const gif = await encodeGif(result.frames, (input as { gifFps?: number }).gifFps ?? 2)
+          return { events: result.events, gif }
+        }
+        return result
+      },
     },
 
     {
       name: 'get_capture',
-      description: 'Peek at captured network data without stopping the capture. Returns current entries and count of pending (in-flight) requests.',
+      description: 'Peek at captured data without stopping. Returns current events (time-sorted, with "kind" field) and count of pending in-flight requests.',
       inputSchema: {
         type: 'object',
         properties: {},

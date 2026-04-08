@@ -10,18 +10,47 @@ const MAX_NETWORK_LOG = 500
 
 // ─── Deep capture state (Chrome Debugger API) ──────────────────────────────
 // Captures full request/response bodies across ALL windows including popups.
+// Optionally captures input events (mouse + keyboard) for a unified time-series.
 // Use startCapture/stopCapture/getCapture actions to control.
 let captureActive = false
-let captureBuffer = []           // completed request/response pairs
+let captureBuffer = []           // completed request/response pairs + input events
 let capturePending = new Map()   // requestId -> partial entry (waiting for response body)
 let capturedTabs = new Set()     // tabIds with debugger attached
 let captureUrlFilter = null      // only capture URLs containing this string
+let captureInputEnabled = false  // when true, periodically drain input events from tabs
+let captureInputInterval = null  // interval handle for input draining
+let captureStartWallMs = 0       // Date.now() at capture start — used to convert CDP monotonic timestamps
+let captureStartMonotonic = 0    // first CDP timestamp seen — used with captureStartWallMs for conversion
+let captureMonotonicCalibrated = false
 const MAX_CAPTURE_BODY = 512000  // 500KB max per response body
 const MAX_CAPTURE_ENTRIES = 2000
+const INPUT_DRAIN_INTERVAL_MS = 2000
 
 function matchesCaptureFilter(url) {
   if (!captureUrlFilter) return true
   return url.toLowerCase().includes(captureUrlFilter.toLowerCase())
+}
+
+// CDP timestamps are monotonic seconds (like performance.now()/1000), not Unix epoch.
+// We calibrate on the first event: record both Date.now() and the CDP timestamp,
+// then compute wall-clock time for all subsequent events via offset.
+function cdpTimestampToIso(cdpTimestamp) {
+  if (!captureMonotonicCalibrated) {
+    captureStartMonotonic = cdpTimestamp
+    captureStartWallMs = Date.now()
+    captureMonotonicCalibrated = true
+  }
+  const offsetMs = (cdpTimestamp - captureStartMonotonic) * 1000
+  return new Date(captureStartWallMs + offsetMs).toISOString()
+}
+
+function cdpTimestampToEpochMs(cdpTimestamp) {
+  if (!captureMonotonicCalibrated) {
+    captureStartMonotonic = cdpTimestamp
+    captureStartWallMs = Date.now()
+    captureMonotonicCalibrated = true
+  }
+  return captureStartWallMs + (cdpTimestamp - captureStartMonotonic) * 1000
 }
 
 // Tabs with these URL schemes can't be debugged — attach will hang or throw
@@ -135,7 +164,7 @@ function handleDebuggerEvent(source, method, params) {
       responseHeaders: {},
       responseBody: null,
       mimeType: null,
-      startTime: new Date(timestamp * 1000).toISOString(),
+      startTime: cdpTimestampToIso(timestamp),
       _startTimestamp: timestamp,
       _requestId: params.requestId,
       endTime: null,
@@ -156,7 +185,7 @@ function handleDebuggerEvent(source, method, params) {
     const { timestamp } = params
     const entry = capturePending.get(key)
     if (!entry) return
-    entry.endTime = new Date(timestamp * 1000).toISOString()
+    entry.endTime = cdpTimestampToIso(timestamp)
     entry.duration = Math.round((timestamp - entry._startTimestamp) * 1000)
 
     // Fetch response body — only for text-based content
@@ -192,7 +221,7 @@ function handleDebuggerEvent(source, method, params) {
     const entry = capturePending.get(key)
     if (!entry) return
     entry.error = errorText
-    entry.endTime = new Date(timestamp * 1000).toISOString()
+    entry.endTime = cdpTimestampToIso(timestamp)
     entry.duration = Math.round((timestamp - entry._startTimestamp) * 1000)
     finalizeEntry(key, entry)
   }
@@ -200,10 +229,56 @@ function handleDebuggerEvent(source, method, params) {
 
 function finalizeEntry(key, entry) {
   capturePending.delete(key)
+  // Convert _startTimestamp (CDP monotonic) to wall-clock epoch ms for sorting
+  entry._ts = cdpTimestampToEpochMs(entry._startTimestamp)
   delete entry._startTimestamp
   delete entry._requestId
+  entry.kind = 'network'
   captureBuffer.push(entry)
   if (captureBuffer.length > MAX_CAPTURE_ENTRIES) captureBuffer.shift()
+}
+
+// Drain input events from all captured tabs into the capture buffer
+async function drainInputEvents() {
+  if (!captureInputEnabled || !captureActive) return
+  for (const tabId of capturedTabs) {
+    try {
+      const result = await sendToContentScript(tabId, { action: 'getInputLog', clear: true })
+      if (result?.success && Array.isArray(result.data)) {
+        for (const evt of result.data) {
+          captureBuffer.push({
+            kind: 'input',
+            tabId,
+            inputType: evt.type,
+            x: evt.x,
+            y: evt.y,
+            key: evt.key,
+            button: evt.button,
+            modifiers: evt.modifiers,
+            _ts: evt.t,
+            time: new Date(evt.t).toISOString(),
+          })
+          if (captureBuffer.length > MAX_CAPTURE_ENTRIES) captureBuffer.shift()
+        }
+      }
+    } catch {
+      // Tab may have closed or content script not injected — skip
+    }
+  }
+}
+
+function startInputDraining() {
+  stopInputDraining()
+  captureInputEnabled = true
+  captureInputInterval = setInterval(drainInputEvents, INPUT_DRAIN_INTERVAL_MS)
+}
+
+function stopInputDraining() {
+  captureInputEnabled = false
+  if (captureInputInterval) {
+    clearInterval(captureInputInterval)
+    captureInputInterval = null
+  }
 }
 
 // Clean up when a debugged tab closes
@@ -751,6 +826,7 @@ export async function executeCommand(command) {
       case 'startCapture': {
         if (captureActive) {
           // Stop existing capture first
+          stopInputDraining()
           for (const tabId of capturedTabs) {
             await detachDebuggerFromTab(tabId)
           }
@@ -762,6 +838,9 @@ export async function executeCommand(command) {
         capturePending = new Map()
         capturedTabs = new Set()
         captureUrlFilter = command.urlFilter || null
+        captureMonotonicCalibrated = false
+        captureStartWallMs = 0
+        captureStartMonotonic = 0
 
         // Register the debugger event handler (remove first to avoid double-registering)
         try { chrome.debugger.onEvent.removeListener(handleDebuggerEvent) } catch { /* ignore */ }
@@ -775,15 +854,64 @@ export async function executeCommand(command) {
           chrome.webNavigation.onBeforeNavigate.addListener(onCaptureNavigation)
         }
 
-        // Attach to all existing tabs
         // Attach to all existing tabs in parallel (sequential was causing 30s timeout)
         const allTabs = await chrome.tabs.query({})
         await Promise.allSettled(allTabs.map(tab => attachDebuggerToTab(tab.id)))
 
-        return { success: true, data: { tabsAttached: capturedTabs.size, urlFilter: captureUrlFilter } }
+        // Start draining input events if requested
+        if (command.includeInput) {
+          // Inject content + page scripts into already-open tabs so input listeners are active.
+          // Content scripts only auto-inject on new page loads (document_idle), so tabs that
+          // were open before capture started won't have them yet.
+          await Promise.allSettled([...capturedTabs].map(async (tabId) => {
+            try {
+              // Inject page script (MAIN world) first — captures input events
+              await chrome.scripting.executeScript({
+                target: { tabId },
+                world: 'MAIN',
+                files: ['content/page-script.js'],
+              })
+              // Inject content script (ISOLATED world) — bridges page script to service worker
+              await chrome.scripting.executeScript({
+                target: { tabId },
+                files: ['content/content-script.js'],
+              })
+            } catch {
+              // Tab may not support script injection (e.g. PDF viewer) — skip
+            }
+          }))
+          startInputDraining()
+        }
+
+        // Start GIF recording if requested
+        if (command.recordGif) {
+          const tab = await getTargetTab(command.tabId)
+          if (tab) {
+            recordingTabId = tab.id
+            recordingFrames = []
+            recordingActive = true
+            const intervalMs = Math.round(1000 / (command.gifFps || 2))
+            if (recordingInterval) clearInterval(recordingInterval)
+            recordingInterval = setInterval(async () => {
+              if (!recordingActive) return
+              try {
+                const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
+                recordingFrames.push({ dataUrl, timestamp: Date.now() })
+              } catch { /* tab may have navigated, skip frame */ }
+            }, intervalMs)
+          }
+        }
+
+        return { success: true, data: { tabsAttached: capturedTabs.size, urlFilter: captureUrlFilter, includeInput: !!command.includeInput, recordGif: !!command.recordGif } }
       }
 
       case 'stopCapture': {
+        // Final drain of input events before stopping
+        if (captureInputEnabled) {
+          await drainInputEvents()
+        }
+        stopInputDraining()
+
         captureActive = false
         chrome.tabs.onCreated.removeListener(onCaptureTabCreated)
         if (chrome.webNavigation) {
@@ -800,22 +928,45 @@ export async function executeCommand(command) {
 
         // Flush any remaining pending entries (incomplete requests)
         for (const [requestId, entry] of capturePending) {
+          entry._ts = cdpTimestampToEpochMs(entry._startTimestamp)
           delete entry._startTimestamp
+          delete entry._requestId
+          entry.kind = 'network'
           entry.responseBody = entry.responseBody || '[incomplete — capture stopped]'
           captureBuffer.push(entry)
         }
         capturePending.clear()
 
-        const result = [...captureBuffer]
+        // Stop GIF recording if it was running
+        let frames = null
+        if (recordingActive) {
+          if (recordingInterval) { clearInterval(recordingInterval); recordingInterval = null }
+          recordingActive = false
+          frames = recordingFrames.slice()
+          recordingFrames = []
+        }
+
+        // Sort by timestamp for unified time-series
+        const result = [...captureBuffer].sort((a, b) => (a._ts || 0) - (b._ts || 0))
+        // Clean up internal fields
+        result.forEach(e => delete e._ts)
         captureBuffer = []
-        return { success: true, data: result }
+
+        const response = { events: result }
+        if (frames) response.frames = frames
+        return { success: true, data: response }
       }
 
       case 'getCapture': {
-        // Peek at current capture without stopping
-        const snapshot = [...captureBuffer]
+        // Drain input events before peeking
+        if (captureInputEnabled) {
+          await drainInputEvents()
+        }
+        // Sort by timestamp for unified time-series
+        const sorted = [...captureBuffer].sort((a, b) => (a._ts || 0) - (b._ts || 0))
+        const snapshot = sorted.map(e => { const copy = { ...e }; delete copy._ts; return copy })
         const pending = capturePending.size
-        return { success: true, data: { entries: snapshot, pendingRequests: pending, active: captureActive } }
+        return { success: true, data: { entries: snapshot, pendingRequests: pending, active: captureActive, includeInput: captureInputEnabled } }
       }
 
       case 'resizeWindow': {
