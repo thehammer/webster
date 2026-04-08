@@ -23,6 +23,8 @@ let captureInputInterval = null  // interval handle for input draining
 let captureStartWallMs = 0       // Date.now() at capture start — used to convert CDP monotonic timestamps
 let captureStartMonotonic = 0    // first CDP timestamp seen — used with captureStartWallMs for conversion
 let captureMonotonicCalibrated = false
+let captureRecordingFrames = false // true when recordFrames is active — tells drainInputEvents to show cursor
+let captureCursorShown = false     // true once we've sent showCursor to content scripts
 const MAX_CAPTURE_BODY = 512000  // 500KB max per response body
 const INPUT_DRAIN_INTERVAL_MS = 2000
 
@@ -238,13 +240,20 @@ function finalizeEntry(key, entry) {
 
 // Drain input events from all captured tabs and stream them to the server.
 // Each tab gets a 1.5s budget — if the content script doesn't respond, skip it.
+// On the first drain when recording frames, piggybacks showCursor to enable the DOM cursor overlay.
 async function drainInputEvents() {
   if (!captureInputEnabled || !captureActive) return
+  const wantCursor = captureRecordingFrames
+  if (wantCursor) captureCursorShown = true
   const tabs = [...capturedTabs]
   await Promise.allSettled(tabs.map(async (tabId) => {
     try {
       const result = await withTimeout(
-        sendToContentScript(tabId, { action: 'getInputLog', clear: true }),
+        sendToContentScript(tabId, {
+          action: 'getInputLog',
+          clear: true,
+          ...(wantCursor ? { showCursor: true } : {}),
+        }),
         1500
       )
       if (result?.success && Array.isArray(result.data)) {
@@ -856,6 +865,8 @@ export async function executeCommand(command) {
         capturedTabs = new Set()
         captureUrlFilter = command.urlFilter || null
         captureMonotonicCalibrated = false
+        captureRecordingFrames = false
+        captureCursorShown = false
         captureStartWallMs = 0
         captureStartMonotonic = 0
 
@@ -909,6 +920,12 @@ export async function executeCommand(command) {
             recordingActive = true
             const intervalMs = Math.round(1000 / (command.fps || 2))
             if (recordingInterval) clearTimeout(recordingInterval)
+
+            // Cursor overlay will be activated on the first input drain
+            // (piggybacks on sendToContentScript which works on CSP-strict pages)
+            captureRecordingFrames = true
+            captureCursorShown = false
+
             function captureFrame() {
               if (!recordingActive) return
               chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 30 })
@@ -941,11 +958,20 @@ export async function executeCommand(command) {
           chrome.webNavigation.onBeforeNavigate.removeListener(onCaptureNavigation)
         }
 
-        // Stop frame recording
+        // Stop frame recording and hide cursor overlay
         if (recordingActive) {
           if (recordingInterval) { clearTimeout(recordingInterval); recordingInterval = null }
           recordingActive = false
           recordingFrames = []
+          captureRecordingFrames = false
+          // Hide cursor overlay by piggybacking on a final input drain
+          if (captureCursorShown) {
+            const allTabs = [...capturedTabs]
+            await Promise.allSettled(allTabs.map(tabId =>
+              sendToContentScript(tabId, { action: 'getInputLog', clear: true, hideCursor: true }).catch(() => {})
+            ))
+            captureCursorShown = false
+          }
         }
 
         // Flush remaining pending entries (incomplete requests) to server

@@ -142,6 +142,46 @@
     return origXHRSend.call(this, body)
   }
 
+  // ─── Cursor overlay for capture recordings ────────────────────────────────
+  // When enabled, renders a visible cursor in the DOM so captureVisibleTab
+  // includes it in screenshots. The OS cursor is never captured by the API.
+  let cursorOverlay = null
+
+  function showCursorOverlay() {
+    if (cursorOverlay) return
+    cursorOverlay = document.createElement('div')
+    cursorOverlay.id = '__webster_cursor'
+    // Pointer SVG as inline data URI — 20x20 classic arrow cursor
+    cursorOverlay.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20">
+      <path d="M2 1 L2 17 L6.5 12.5 L10.5 19 L13 18 L9 11 L15 11 Z" fill="white" stroke="black" stroke-width="1.2"/>
+    </svg>`
+    Object.assign(cursorOverlay.style, {
+      position: 'fixed',
+      top: '0px',
+      left: '0px',
+      width: '20px',
+      height: '20px',
+      pointerEvents: 'none',
+      zIndex: '2147483647',
+      transform: 'translate(-2px, -1px)',
+      filter: 'drop-shadow(1px 1px 1px rgba(0,0,0,0.3))',
+    })
+    document.documentElement.appendChild(cursorOverlay)
+  }
+
+  function hideCursorOverlay() {
+    if (cursorOverlay) {
+      cursorOverlay.remove()
+      cursorOverlay = null
+    }
+  }
+
+  function moveCursorOverlay(x, y) {
+    if (!cursorOverlay) return
+    cursorOverlay.style.left = x + 'px'
+    cursorOverlay.style.top = y + 'px'
+  }
+
   // ─── Input event capture ──────────────────────────────────────────────────
   const inputBuffer = []
   const MAX_INPUT = 200
@@ -165,6 +205,7 @@
   const MOUSE_BUTTONS = ['left', 'middle', 'right']
 
   document.addEventListener('mousemove', (e) => {
+    moveCursorOverlay(e.clientX, e.clientY)
     const now = Date.now()
     if (now - lastMouseMoveTime < MOUSEMOVE_THROTTLE_MS) return
     lastMouseMoveTime = now
@@ -211,7 +252,22 @@
       const clear = event.data.clear !== false
       const entries = [...inputBuffer]
       if (clear) inputBuffer.length = 0
+      // Auto-show cursor overlay on first input drain (capture is active and recording)
+      if (event.data.showCursor && !cursorOverlay) {
+        showCursorOverlay()
+      }
+      if (event.data.hideCursor) {
+        hideCursorOverlay()
+      }
       window.postMessage({ type: 'WEBSTER_INPUT_RESULT', entries }, '*')
+    }
+
+    if (event.data?.type === 'WEBSTER_SHOW_CURSOR') {
+      showCursorOverlay()
+    }
+
+    if (event.data?.type === 'WEBSTER_HIDE_CURSOR') {
+      hideCursorOverlay()
     }
   })
 })()

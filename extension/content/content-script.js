@@ -55,10 +55,10 @@ function getNetworkEntries() {
   })
 }
 
-function getInputEntries(clear = true) {
+function getInputEntries(clear = true, opts = {}) {
   return new Promise((resolve) => {
     pendingInputResolve = resolve
-    window.postMessage({ type: 'WEBSTER_READ_INPUT', clear }, '*')
+    window.postMessage({ type: 'WEBSTER_READ_INPUT', clear, ...opts }, '*')
     setTimeout(() => {
       if (pendingInputResolve) { pendingInputResolve([]); pendingInputResolve = null }
     }, 1000)
@@ -172,8 +172,21 @@ async function handleCommand(cmd) {
       }
 
       case 'getInputLog': {
-        const entries = await getInputEntries(cmd.clear !== false)
+        const entries = await getInputEntries(cmd.clear !== false, {
+          showCursor: cmd.showCursor,
+          hideCursor: cmd.hideCursor,
+        })
         return { success: true, data: entries }
+      }
+
+      case 'showCursor': {
+        window.postMessage({ type: 'WEBSTER_SHOW_CURSOR' }, '*')
+        return { success: true }
+      }
+
+      case 'hideCursor': {
+        window.postMessage({ type: 'WEBSTER_HIDE_CURSOR' }, '*')
+        return { success: true }
       }
 
       case 'find': {
