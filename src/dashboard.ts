@@ -273,7 +273,7 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
     const filter = (document.getElementById('sessionSearch').value || '').toLowerCase();
     const filtered = filter
       ? allSessions.filter(s => {
-          const haystack = [s.id, s.status, s.startedAt, s.config?.urlFilter].filter(Boolean).join(' ').toLowerCase();
+          const haystack = [s.id, s.name, s.status, s.startedAt, s.config?.urlFilter].filter(Boolean).join(' ').toLowerCase();
           return haystack.includes(filter);
         })
       : allSessions;
@@ -292,10 +292,19 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
       const events = s.eventCount || 0;
       const frames = s.frameCount || 0;
       const status = s.status || 'unknown';
+      const name = s.name || '';
       const statusBadge = status === 'active' ? '<span style="color:#6bdb6b">active</span>'
         : status === 'abandoned' ? '<span style="color:#888">stale</span>' : '';
+      const thumbHtml = frames > 0
+        ? '<img src="' + BASE + '/replay/' + esc(s.id) + '/frame/frame_00001.jpg" style="height:32px;border-radius:3px;object-fit:cover;margin-right:4px" loading="lazy">'
+        : '';
+      const nameHtml = name
+        ? '<span class="session-name" style="color:#7ec8e3;cursor:pointer" onclick="renameSession(\\'' + esc(s.id) + '\\')" title="Click to rename">' + esc(name) + '</span>'
+        : '<span class="session-name" style="color:#555;cursor:pointer;font-style:italic" onclick="renameSession(\\'' + esc(s.id) + '\\')" title="Click to name">name...</span>';
       return '<li class="session-item">' +
+        thumbHtml +
         '<span class="id">' + esc(id) + '</span>' +
+        nameHtml +
         '<span class="date">' + esc(date) + ' ' + statusBadge + '</span>' +
         '<span class="stats">' +
           '<span>' + events + ' events</span>' +
@@ -351,6 +360,23 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 
   window.copyReplayURL = function(id) {
     navigator.clipboard.writeText(BASE + '/replay/' + id).catch(() => {});
+  };
+
+  window.renameSession = async function(id) {
+    const session = allSessions.find(s => s.id === id);
+    const current = session?.name || '';
+    const name = prompt('Session name:', current);
+    if (name === null) return; // cancelled
+    try {
+      await fetch(BASE + '/api/sessions/' + id, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name }),
+      });
+      await loadSessions();
+    } catch (e) {
+      alert('Failed to rename: ' + e.message);
+    }
   };
 
   window.deleteSession = async function(id) {

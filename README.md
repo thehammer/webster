@@ -1,21 +1,26 @@
 # Webster
 
-Browser automation MCP server for Claude Code. Gives Claude full control of your browser — navigate pages, click elements, read DOM, take screenshots, inspect network traffic, manage tabs, capture input events, and more.
+Browser automation MCP server for Claude Code. Gives Claude full control of your browser — navigate pages, click elements, read DOM, take screenshots, inspect network traffic, manage tabs, capture sessions with full replay.
 
 Supports **Chrome, Firefox, and Safari** simultaneously. Switch between browsers with a single tool call. Multiple Claude Code sessions share the same server and browser connection concurrently.
 
 ## How it works
 
-Webster has two parts:
+Webster has three parts:
 
 1. **MCP server** — a persistent local server that Claude Code connects to over HTTP
 2. **Browser extension** — auto-connects to the server via WebSocket and executes browser commands
+3. **Menu bar app** *(optional, macOS)* — system tray icon with capture controls and global hotkey
 
 ```
 Claude Code Session A ──┐
 Claude Code Session B ──┤── HTTP /mcp ──→ Webster Server ──→ Browser Extension ──→ Browser
 Claude Code Session C ──┘    (persistent,                     (WebSocket)
                                launchd-managed)
+                                    ↑
+                              Menu Bar App ── polls /api/*
+                              Web Dashboard ── /dashboard
+                              Replay Viewer ── /replay/{id}
 ```
 
 Chrome and Firefox connect via WebSocket. Safari connects via HTTP long-poll (Safari's extension sandbox blocks raw sockets from service workers). All three can be active simultaneously — use `get_browsers` / `set_browser` to route between them.
@@ -87,20 +92,6 @@ launchctl load ~/Library/LaunchAgents/com.yourname.webster.plist
 }
 ```
 
-**Alternative: stdio mode** (single session, spawned per Claude Code session):
-
-```json
-{
-  "mcpServers": {
-    "webster": {
-      "command": "bun",
-      "args": ["/path/to/webster/src/index.ts"],
-      "env": { "WEBSTER_MCP_MODE": "stdio" }
-    }
-  }
-}
-```
-
 ### 2. Install the browser extension
 
 Build for your browser(s):
@@ -129,6 +120,81 @@ Then enable Webster in Safari → Settings → Extensions.
 
 The extension auto-connects to the server on port 3456. The popup shows connection status and lets you add additional server ports for concurrent sessions.
 
+### 3. Install the menu bar app (optional, macOS)
+
+```bash
+./scripts/install-menubar.sh
+```
+
+This builds the Swift menu bar app, installs it to `/usr/local/bin/webster-menu`, and creates a launchd agent so it starts automatically.
+
+Or run in development:
+```bash
+cd menubar && swift build && .build/debug/WebsterMenu
+```
+
+## Capture & Replay
+
+Webster can record comprehensive browser sessions:
+
+```
+start_capture(includeInput: true, recordFrames: true)
+# ... browse around ...
+stop_capture()
+# → returns { sessionId, replayUrl, eventCount, frameCount, ... }
+```
+
+Captures include:
+- **Full network request/response bodies** via Chrome Debugger Protocol
+- **Mouse & keyboard input** (clicks, moves, keypresses)
+- **Console output** (log, warn, error, info)
+- **JS errors** and unhandled rejections
+- **Page state** (URL, title, scroll position, viewport)
+- **Screenshot frames** for video playback
+
+Data streams from the extension to the server in real-time — resilient to browser extension restarts. Stored on disk under `~/.webster/captures/`.
+
+### Replay viewer
+
+Open `http://localhost:3456/replay/{sessionId}` to view a captured session:
+
+- Video playback from captured frames
+- Network waterfall with timing bars
+- Click overlay showing input events on the video
+- Console output panel synced to timeline
+- Page state bar (URL, title, scroll)
+- Event density minimap
+- Keyboard controls: Space (play/pause), arrows (seek), < > (speed)
+
+### Web dashboard
+
+Open `http://localhost:3456/dashboard` for a web UI with:
+
+- Server status and connected browsers
+- Start/stop capture with URL filter and options
+- Session history with thumbnails, names, and replay links
+- Search/filter sessions
+- Delete and rename sessions
+
+### Menu bar app
+
+The macOS menu bar app provides:
+
+- Spider icon with live server/browser status
+- Start/stop capture from the tray
+- **Global hotkey: ⌃⌥R** (Ctrl+Option+R) toggles capture from any app
+- Recent sessions with thumbnails and one-click replay
+- Copy replay URL, delete sessions
+
+### Export video
+
+```
+export_video(format: "mp4")  # also: webm, gif
+# → returns file path to encoded video
+```
+
+Requires `ffmpeg` installed locally.
+
 ## Multi-browser usage
 
 When multiple browsers are connected, use `get_browsers` and `set_browser`:
@@ -148,12 +214,11 @@ Multiple Claude Code sessions share the same Webster server — each gets an ind
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WEBSTER_PORT` | `3456` | Port for both the extension WebSocket and MCP HTTP clients |
-| `WEBSTER_MCP_MODE` | — | Set to `stdio` to use stdio transport instead of HTTP |
+| `WEBSTER_PORT` | `3456` | Port for WebSocket, MCP HTTP, dashboard, and replay viewer |
 
-Server registry: `~/.webster/registry.json`. Logs: `~/.webster/webster.log`.
+Server registry: `~/.webster/registry.json`. Logs: `~/.webster/webster.log`. Captures: `~/.webster/captures/`.
 
-## Tools (42 total)
+## Tools (40 total)
 
 ### Navigation & interaction
 | Tool | Description |
@@ -200,12 +265,17 @@ Server registry: `~/.webster/registry.json`. Logs: `~/.webster/webster.log`.
 |------|-------------|
 | `get_network_log` | Get buffered network requests (URL, status, timing) |
 | `wait_for_network_idle` | Wait until no in-flight requests |
-| `start_capture` | Start deep network capture — full req/res bodies via Chrome Debugger |
-| `stop_capture` | Stop capture and return all data |
-| `get_capture` | Peek at capture buffer without stopping |
 | `get_cookies` | Get cookies for a URL |
 | `get_local_storage` | Read localStorage |
 | `set_local_storage` | Write localStorage |
+
+### Capture
+| Tool | Description |
+|------|-------------|
+| `start_capture` | Start deep capture — network bodies, input, console, frames |
+| `stop_capture` | Stop capture, returns summary with replay URL |
+| `get_capture` | Read capture data — summary, events, or single event by index |
+| `export_video` | Encode captured frames to mp4, webm, or gif |
 
 ### Console & input
 | Tool | Description |
@@ -217,22 +287,15 @@ Server registry: `~/.webster/registry.json`. Logs: `~/.webster/webster.log`.
 | Tool | Description |
 |------|-------------|
 | `wait_for` | Wait for an element to appear in the DOM |
-| `wait_for_network_idle` | Wait until network is idle |
-
-### Recording
-| Tool | Description |
-|------|-------------|
-| `start_recording` | Start capturing frames from the active tab |
-| `stop_recording` | Stop recording and return frames |
-| `export_gif` | Encode captured frames as an animated GIF |
 
 ## Development
 
 ```bash
-bun test                              # run tests (34 tests)
+bun test                              # run tests (60 tests)
 bun run typecheck                     # type check
 bun start                             # start server manually
 ./scripts/build-extension.sh --all   # build all browser extensions
+cd menubar && swift build             # build menu bar app
 ```
 
 ## License

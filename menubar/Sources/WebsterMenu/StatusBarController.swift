@@ -259,7 +259,8 @@ final class StatusBarController: NSObject {
                 let events = session.eventCount ?? 0
                 let frames = session.frameCount ?? 0
                 let date = formatDate(session.startedAt)
-                let title = "\(shortId) — \(date) — \(events)ev \(frames)fr"
+                let name = session.name ?? shortId
+                let title = "\(name) — \(date) — \(events)ev \(frames)fr"
 
                 // Each session gets a submenu with actions
                 let sessionSubmenu = NSMenu()
@@ -393,24 +394,20 @@ final class StatusBarController: NSObject {
 
     private func loadThumbnail(sessionId: String) {
         guard let url = client.replayURL(sessionId: sessionId) else { return }
-        // Derive frame URL from replay URL
         let frameURL = URL(string: url.absoluteString + "/frame/frame_00001.jpg")!
-        Task.detached(priority: .background) {
+        Task {
             do {
                 let (data, _) = try await URLSession.shared.data(from: frameURL)
                 guard let fullImage = NSImage(data: data) else { return }
-                // Scale to menu bar thumbnail size (24px tall)
                 let thumbHeight: CGFloat = 24
-                let aspect = fullImage.size.width / fullImage.size.height
+                let aspect = fullImage.size.width / max(fullImage.size.height, 1)
                 let thumbSize = NSSize(width: thumbHeight * aspect, height: thumbHeight)
                 let thumb = NSImage(size: thumbSize, flipped: false) { rect in
                     fullImage.draw(in: rect)
                     return true
                 }
-                await MainActor.run {
-                    self.thumbnailCache[sessionId] = thumb
-                    self.buildMenu()
-                }
+                self.thumbnailCache[sessionId] = thumb
+                // Menu will pick it up on next poll cycle
             } catch { /* skip thumbnail */ }
         }
     }

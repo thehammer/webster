@@ -30,6 +30,7 @@ struct CaptureStatus: Decodable {
 
 struct SessionInfo: Decodable {
     let id: String
+    let name: String?
     let status: String?
     let startedAt: String?
     let finishedAt: String?

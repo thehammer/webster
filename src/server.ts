@@ -270,6 +270,19 @@ export class WebsterServer {
       return Response.json(snap)
     }
 
+    if (req.method === 'PATCH' && url.pathname.startsWith('/api/sessions/')) {
+      const id = url.pathname.slice('/api/sessions/'.length)
+      if (!id || /[\/\\.]/.test(id)) return new Response('Invalid ID', { status: 400 })
+      const metaPath = join(CAPTURES_DIR, id, 'meta.json')
+      if (!existsSync(metaPath)) return new Response('Not found', { status: 404 })
+      let body: Record<string, unknown> = {}
+      try { body = await req.json() as Record<string, unknown> } catch { return new Response('Bad JSON', { status: 400 }) }
+      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'))
+      if (body.name !== undefined) meta.name = body.name || null
+      writeFileSync(metaPath, JSON.stringify(meta, null, 2))
+      return Response.json(meta)
+    }
+
     if (req.method === 'DELETE' && url.pathname.startsWith('/api/sessions/')) {
       const id = url.pathname.slice('/api/sessions/'.length)
       if (!id || /[\/\\.]/.test(id)) return new Response('Invalid ID', { status: 400 })
