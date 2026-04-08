@@ -3,7 +3,7 @@ import { join } from 'path'
 
 // ─── Route handler ───────────────────────────────────────────────────────────
 
-const UUID_RE = /^[0-9a-f-]{36}$/
+const SAFE_ID_RE = /^[0-9a-zA-Z_-]+$/
 const FRAME_RE = /^frame_\d{5}\.jpg$/
 
 export function handleReplayRequest(req: Request, capturesDir: string): Response {
@@ -11,7 +11,7 @@ export function handleReplayRequest(req: Request, capturesDir: string): Response
   const parts = url.pathname.slice(1).split('/') // ['replay', sessionId, ...rest]
   const sessionId = parts[1]
 
-  if (!sessionId || !UUID_RE.test(sessionId)) {
+  if (!sessionId || !SAFE_ID_RE.test(sessionId)) {
     return new Response('Invalid session ID', { status: 400 })
   }
 

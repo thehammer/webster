@@ -265,7 +265,7 @@ export class WebsterServer {
 
     if (req.method === 'DELETE' && url.pathname.startsWith('/api/sessions/')) {
       const id = url.pathname.slice('/api/sessions/'.length)
-      if (!/^[0-9a-f-]{36}$/.test(id)) return new Response('Invalid ID', { status: 400 })
+      if (!id || /[\/\\.]/.test(id)) return new Response('Invalid ID', { status: 400 })
       const dir = join(CAPTURES_DIR, id)
       if (!existsSync(dir)) return new Response('Not found', { status: 404 })
       const { rmSync } = await import('fs')
