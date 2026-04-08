@@ -5,6 +5,7 @@ import { isResult, isCaptureEvent, isCaptureDone, type WsCommand, type WsMessage
 import { CaptureSession, cleanOldSessions, CAPTURES_DIR, type CaptureConfig, type CaptureEvent } from './capture.js'
 import { handleReplayRequest } from './replay.js'
 import { buildDashboardHtml } from './dashboard.js'
+import { FAVICON_SVG } from './favicon.js'
 
 // ─── Registry ─────────────────────────────────────────────────────────────────
 // Each Webster server process registers itself so concurrent sessions can
@@ -106,6 +107,12 @@ export class WebsterServer {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async handleFetch(req: Request, server: any): Promise<Response> {
     const url = new URL(req.url)
+
+    if (url.pathname === '/favicon.ico' || url.pathname === '/favicon.svg') {
+      return new Response(FAVICON_SVG, {
+        headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' },
+      })
+    }
 
     if (url.pathname === '/mcp') {
       if (this.mcpHandler) return this.mcpHandler(req)
