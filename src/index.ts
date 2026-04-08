@@ -16,6 +16,7 @@ try {
   await new Promise(r => setTimeout(r, 300))
   wsServer = new WebsterServer(PORT) // throws with real error if still busy
 }
+wsServer.registerSelf()
 const tools = createTools(wsServer)
 
 const mcpServer = new Server(

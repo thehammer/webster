@@ -165,6 +165,156 @@ Marketplace/distribution improvements are explicitly out of scope for now.
 
 ---
 
+---
+
+## Phase 9 — Concurrent Claude Sessions
+
+**Goal:** Multiple Claude sessions (separate `webster` MCP processes) can run simultaneously, each targeting different tabs without stepping on each other.
+
+**Architecture:** Each `webster` process writes its port to a shared registry file (`~/.webster/registry.json`). The extension connects to all registered servers simultaneously. Tabs can be claimed by a session; commands to unclaimed tabs are routed to whichever server sent the command.
+
+### Phase 9-A — Registry File
+
+**Files changed:**
+- `src/server.ts` — on startup, write `{ port, pid, started }` to `~/.webster/registry.json` (append to array); on shutdown, remove own entry
+- `src/index.ts` — call `wsServer.registerSelf()` after construction, `wsServer.deregisterSelf()` in SIGINT/SIGTERM
+
+**Details:**
+- Registry lives at `~/.webster/registry.json` (create dir if needed)
+- On startup: read existing array, filter out dead PIDs (kill -0 check), append own entry, write back
+- On shutdown: read, filter out own port, write back
+- File lock: use a `.lock` file with `O_EXCL` to prevent races
+
+---
+
+### Phase 9-B — Tab Ownership
+
+**Files changed:**
+- `src/server.ts` — add `tabOwnership: Map<number, string>` (tabId → ownerPort); expose `claimTab(tabId)`, `releaseTab(tabId)`, `isOwned(tabId)` methods
+- `src/tools.ts` — add `claim_tab` and `release_tab` tools
+
+**New tools:**
+- `claim_tab` — parameters: `tabId?: number` (defaults to active tab) — marks tab as owned by this server; returns `{ tabId, port }`
+- `release_tab` — parameters: `tabId?: number` — releases ownership
+
+**Ownership rules:**
+- Commands to an owned tab from a different server are rejected with `{ error: "tab owned by port XXXX" }`
+- Unowned tabs: first-come-first-served (no rejection)
+- `open_tab` automatically claims the new tab for the calling server
+
+---
+
+### Phase 9-C — Multi-Server Extension Connection
+
+**Files changed:**
+- `extension/background/service-worker.js` — read registry on connect, maintain a `Map<port, WebSocket>` of server connections; route command responses back to originating connection
+- `extension/background/safari-service-worker.js` — same for HTTP long-poll
+
+**Details:**
+- On extension startup: read `~/.webster/registry.json` (via `fetch('http://localhost:3456/registry')` — each server exposes `/registry` endpoint)
+- Actually simpler: extension hard-connects to a known range or the user configures multiple ports
+- **Preferred approach:** Extension connects to a single "primary" server; primary server proxies to other servers when tab ownership requires it. Keeps extension simple.
+
+---
+
+### Phase 9-D — Popup Update
+
+**Files changed:**
+- `extension/popup/popup.js` — show active session count, which tabs are claimed and by which port
+- `extension/popup/popup.html` — add sessions panel
+
+---
+
+## Phase 10 — Input Dispatching & Monitoring
+
+**Goal:** Expose mouse hover, drag-and-drop, and keyboard press as first-class tools. Capture all user input events (mouse moves, clicks, key presses) into a ring buffer for inspection.
+
+### Phase 10-A — `withDebugger` Helper Refactor
+
+**Files changed:**
+- `extension/background/command-handlers.js` — extract `withDebugger(tabId, fn)` helper used by `clickAt`, `clickRef`, and Phase 8 capture
+
+**Why first:** Hover, drag, and key_press all need debugger attachment. Centralizing avoids duplicating attach/detach logic.
+
+```js
+async function withDebugger(tabId, fn) {
+  // If capture is active and already attached, skip attach/detach
+  if (captureState.active && captureState.attachedTabs.has(tabId)) {
+    return fn({ tabId })
+  }
+  await chrome.debugger.attach({ tabId }, '1.3')
+  try {
+    return await fn({ tabId })
+  } finally {
+    await chrome.debugger.detach({ tabId })
+  }
+}
+```
+
+---
+
+### Phase 10-B — `hover` and `drag` Tools
+
+**Files changed:**
+- `extension/background/command-handlers.js` — add `hover` and `drag` cases
+- `src/tools.ts` — add `hover` and `drag` tools
+
+**New tools:**
+- `hover` — parameters: `x: number`, `y: number`, `tabId?` — dispatches `mouseMoved` via CDP
+- `drag` — parameters: `startX: number`, `startY: number`, `endX: number`, `endY: number`, `steps?: number` (default 10), `tabId?` — dispatches `mousePressed` → N `mouseMoved` → `mouseReleased`
+
+**Implementation:** `Input.dispatchMouseEvent` with types `mouseMoved`, `mousePressed`, `mouseReleased`. For drag, interpolate coordinates across `steps` moves.
+
+---
+
+### Phase 10-C — `key_press` Tool
+
+**Files changed:**
+- `extension/background/command-handlers.js` — add `keyPress` case using `Input.dispatchKeyEvent`
+- `src/tools.ts` — add `key_press` tool
+
+**New tool:**
+- `key_press` — parameters: `key: string` (e.g. `"Enter"`, `"Tab"`, `"ArrowDown"`), `modifiers?: string[]` (e.g. `["ctrl", "shift"]`), `tabId?`
+
+**Implementation:** dispatch `keyDown` + `keyUp` events. Map modifier strings to CDP `modifiers` bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8).
+
+---
+
+### Phase 10-D — Input Monitoring (`get_input_log`)
+
+**Files changed:**
+- `extension/content/page-script.js` — add listeners for `mousemove`, `mousedown`, `mouseup`, `click`, `keydown`, `keyup`; push to ring buffer (max 200 entries, throttle mousemove to 10/s)
+- `extension/content/content-script.js` — forward `GET_INPUT_LOG` message to page script, return buffer
+- `extension/background/command-handlers.js` — add `getInputLog` case
+- `src/tools.ts` — add `get_input_log` tool
+
+**New tool:**
+- `get_input_log` — parameters: `clear?: boolean` (default true), `tabId?` — returns array of input events with timestamps
+
+**Entry format:**
+```json
+{ "type": "click", "x": 450, "y": 320, "button": "left", "t": 1234567890 }
+{ "type": "keydown", "key": "Enter", "modifiers": [], "t": 1234567891 }
+{ "type": "mousemove", "x": 451, "y": 321, "t": 1234567892 }
+```
+
+---
+
+## Phase 9-10 Implementation Order
+
+| Phase | Feature | New Tools | Key File | Status |
+|---|---|---|---|---|
+| 9-A | Registry file | — | `src/server.ts` | ✅ |
+| 9-B | Tab ownership | `claim_tab`, `release_tab` | `src/tools.ts` | ✅ |
+| 9-C | Multi-server extension | — | `service-worker.js` | ✅ |
+| 9-D | Popup update | — | `popup/popup.js` | ✅ |
+| 10-A | `withDebugger` refactor | — | `command-handlers.js` | ✅ |
+| 10-B | hover + drag | `hover`, `drag` | `tools.ts` + handlers | ✅ |
+| 10-C | key_press | `key_press` | `tools.ts` + handlers | ✅ |
+| 10-D | Input monitoring | `get_input_log` | `page-script.js` | ✅ |
+
+---
+
 ## What NOT To Do
 
 - **No persistent debugger attachment** — attach per-command, detach immediately. Exception: `start_capture` intentionally holds persistent attachment for the duration of the capture session (shows warning banner to user).

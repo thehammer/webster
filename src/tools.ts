@@ -498,6 +498,103 @@ export function createTools(server: WebsterServer): WebsterTool[] {
     },
 
     {
+      name: 'hover',
+      description: 'Move the mouse cursor to (x, y) coordinates without clicking. Triggers mouseover/mouseenter/mousemove events — useful for revealing tooltips, dropdown menus, and hover states.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          x: { type: 'number', description: 'X coordinate (pixels from left edge of viewport)' },
+          y: { type: 'number', description: 'Y coordinate (pixels from top edge of viewport)' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+        required: ['x', 'y'],
+      },
+      execute: (input) => dispatch('hover', input),
+    },
+
+    {
+      name: 'drag',
+      description: 'Click and drag from one coordinate to another. Uses real mouse events via Chrome Debugger Protocol. Works for sliders, sortable lists, canvas drag-and-drop.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          startX: { type: 'number', description: 'Starting X coordinate' },
+          startY: { type: 'number', description: 'Starting Y coordinate' },
+          endX: { type: 'number', description: 'Ending X coordinate' },
+          endY: { type: 'number', description: 'Ending Y coordinate' },
+          steps: { type: 'number', description: 'Number of intermediate mouse move events (default 10, more = smoother)' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+        required: ['startX', 'startY', 'endX', 'endY'],
+      },
+      execute: (input) => dispatch('drag', input),
+    },
+
+    {
+      name: 'key_press',
+      description: 'Press a keyboard key using Chrome Debugger Protocol. Works for Enter, Tab, Escape, arrow keys, function keys, and single characters. Use modifiers for Ctrl+C, Shift+Tab, etc.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Key name: "Enter", "Tab", "Escape", "Backspace", "Delete", "Space", "ArrowUp/Down/Left/Right", "Home", "End", "PageUp", "PageDown", "F1"-"F12", or any single character like "a", "A", "1"' },
+          modifiers: {
+            type: 'array',
+            items: { type: 'string', enum: ['alt', 'ctrl', 'meta', 'shift'] },
+            description: 'Modifier keys to hold while pressing (e.g. ["ctrl"] for Ctrl+key, ["ctrl", "shift"] for multi-modifier)',
+          },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+        required: ['key'],
+      },
+      execute: (input) => dispatch('keyPress', input),
+    },
+
+    {
+      name: 'get_input_log',
+      description: 'Return buffered user input events from the current page: mouse moves, clicks, and key presses. Useful for understanding what a user is doing or verifying that programmatic input registered correctly.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          clear: { type: 'boolean', description: 'Clear the buffer after reading (default true)' },
+          tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
+        },
+      },
+      execute: (input) => dispatch('getInputLog', input),
+    },
+
+    {
+      name: 'claim_tab',
+      description: 'Mark a tab as owned by this Claude session. Prevents accidental cross-session interference when multiple Claude sessions share the same browser. Use release_tab when done.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          tabId: { type: 'number', description: 'Tab ID to claim (defaults to active tab)' },
+        },
+      },
+      execute: async (input) => {
+        const tabId = input.tabId as number | undefined
+        const claimed = server.claimTab(tabId)
+        return claimed
+      },
+    },
+
+    {
+      name: 'release_tab',
+      description: 'Release ownership of a tab claimed by this session. Call when done with a tab so other sessions can use it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          tabId: { type: 'number', description: 'Tab ID to release (defaults to active tab, but only if claimed by this session)' },
+        },
+      },
+      execute: async (input) => {
+        const tabId = input.tabId as number | undefined
+        server.releaseTab(tabId)
+        return { released: true, tabId: tabId ?? null }
+      },
+    },
+
+    {
       name: 'get_browsers',
       description: 'List all connected browser extensions. Use this to see which browsers are available before using set_browser.',
       inputSchema: { type: 'object', properties: {} },

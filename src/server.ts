@@ -1,4 +1,39 @@
+import { mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
 import { isResult, type WsCommand, type WsMessage } from './protocol.js'
+
+// ─── Registry ─────────────────────────────────────────────────────────────────
+// Each Webster server process registers itself so concurrent sessions can
+// discover each other and avoid stomping on the same tabs.
+
+interface RegistryEntry {
+  port: number
+  pid: number
+  started: string
+}
+
+const REGISTRY_DIR = join(homedir(), '.webster')
+const REGISTRY_FILE = join(REGISTRY_DIR, 'registry.json')
+
+function readRegistry(): RegistryEntry[] {
+  try {
+    return JSON.parse(readFileSync(REGISTRY_FILE, 'utf-8')) as RegistryEntry[]
+  } catch {
+    return []
+  }
+}
+
+function writeRegistry(entries: RegistryEntry[]): void {
+  try {
+    mkdirSync(REGISTRY_DIR, { recursive: true })
+    writeFileSync(REGISTRY_FILE, JSON.stringify(entries, null, 2))
+  } catch { /* ignore — registry is best-effort */ }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch { return false }
+}
 
 interface PendingCommand {
   resolve: (data: unknown) => void
@@ -28,6 +63,9 @@ export class WebsterServer {
 
   // HTTP long-poll transport — result handlers indexed by command id
   private httpResultHandlers = new Map<string, (result: WsMessage) => void>()
+
+  // Tab ownership — soft advisory locking for concurrent Claude sessions
+  private tabOwnership = new Map<number, string>() // tabId → 'port:pid'
 
   constructor(port: number, commandTimeout = 30000) {
     this.commandTimeout = commandTimeout
@@ -133,6 +171,11 @@ export class WebsterServer {
       }
       this.handleHttpResult(body)
       return new Response(null, { status: 204 })
+    }
+
+    if (req.method === 'GET' && url.pathname === '/registry') {
+      const entries = readRegistry().filter(e => isProcessAlive(e.pid))
+      return Response.json(entries)
     }
 
     // Attempt WebSocket upgrade for all other requests
@@ -322,7 +365,40 @@ export class WebsterServer {
     return this.extensions.size > 0
   }
 
+  // ─── Registry ────────────────────────────────────────────────────────────
+
+  registerSelf(): void {
+    const alive = readRegistry().filter(e => isProcessAlive(e.pid))
+    alive.push({ port: this.port, pid: process.pid, started: new Date().toISOString() })
+    writeRegistry(alive)
+  }
+
+  deregisterSelf(): void {
+    const remaining = readRegistry().filter(e => !(e.port === this.port && e.pid === process.pid))
+    writeRegistry(remaining)
+  }
+
+  // ─── Tab ownership ───────────────────────────────────────────────────────
+
+  claimTab(tabId: number | undefined): { claimed: boolean; tabId: number | null; owner: string } {
+    if (tabId == null) {
+      return { claimed: false, tabId: null, owner: '', }
+    }
+    const owner = `${this.port}:${process.pid}`
+    this.tabOwnership.set(tabId, owner)
+    return { claimed: true, tabId, owner }
+  }
+
+  releaseTab(tabId: number | undefined): void {
+    if (tabId != null) this.tabOwnership.delete(tabId)
+  }
+
+  getClaimedTabs(): Array<{ tabId: number; owner: string }> {
+    return [...this.tabOwnership.entries()].map(([tabId, owner]) => ({ tabId, owner }))
+  }
+
   close(): void {
+    this.deregisterSelf()
     this.server.stop(true)
   }
 }

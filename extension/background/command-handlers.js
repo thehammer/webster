@@ -206,6 +206,32 @@ let recordingFrames = []
 let recordingInterval = null
 let recordingTabId = null
 
+// ─── withDebugger helper ──────────────────────────────────────────────────────
+// Attaches the Chrome Debugger Protocol to a tab, runs fn(target), then detaches.
+// If deep capture is already holding a persistent attachment to this tab, skips
+// attach/detach so we don't interfere with the ongoing capture session.
+async function withDebugger(tabId, fn) {
+  if (!chrome.debugger) {
+    return { success: false, error: 'Debugger API not available on this browser' }
+  }
+  const target = { tabId }
+  const alreadyAttached = captureActive && capturedTabs.has(tabId)
+  if (!alreadyAttached) {
+    try {
+      await chrome.debugger.attach(target, '1.3')
+    } catch {
+      // Already attached (e.g. DevTools open) — proceed anyway
+    }
+  }
+  try {
+    return await fn(target)
+  } finally {
+    if (!alreadyAttached) {
+      try { await chrome.debugger.detach(target) } catch { /* ignore */ }
+    }
+  }
+}
+
 export function setupNetworkMonitoring() {
   chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
@@ -273,6 +299,7 @@ const CONTENT_SCRIPT_ACTIONS = new Set([
   'getLocalStorage', 'setLocalStorage', 'readConsole',
   'getNetworkDetails', 'find',
 ])
+// Note: getInputLog is handled directly in the switch (needs command.clear param)
 
 export async function executeCommand(command) {
   const { action } = command
@@ -531,35 +558,81 @@ export async function executeCommand(command) {
       case 'clickAt': {
         const tab = await getTargetTab(command.tabId)
         if (!tab) return { success: false, error: 'No active tab' }
+        return withDebugger(tab.id, async (target) => {
+          const base = { x: command.x, y: command.y, button: 'left', buttons: 1, clickCount: 1, pointerType: 'mouse' }
+          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' })
+          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' })
+          return { success: true }
+        })
+      }
 
-        if (!chrome.debugger) {
-          return { success: false, error: 'Debugger API not available on this browser' }
-        }
+      case 'hover': {
+        const tab = await getTargetTab(command.tabId)
+        if (!tab) return { success: false, error: 'No active tab' }
+        return withDebugger(tab.id, async (target) => {
+          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+            type: 'mouseMoved', x: command.x, y: command.y, button: 'none', buttons: 0, pointerType: 'mouse',
+          })
+          return { success: true }
+        })
+      }
 
-        const target = { tabId: tab.id }
-        try {
-          await chrome.debugger.attach(target, '1.3')
-        } catch (err) {
-          // Already attached (e.g. DevTools open) — proceed anyway
-        }
-
-        try {
-          const baseParams = {
-            type: 'mousePressed',
-            x: command.x,
-            y: command.y,
-            button: 'left',
-            buttons: 1,
-            clickCount: 1,
-            pointerType: 'mouse',
+      case 'drag': {
+        const tab = await getTargetTab(command.tabId)
+        if (!tab) return { success: false, error: 'No active tab' }
+        const steps = Math.max(1, command.steps || 10)
+        return withDebugger(tab.id, async (target) => {
+          // Press at start position
+          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+            type: 'mousePressed', x: command.startX, y: command.startY,
+            button: 'left', buttons: 1, clickCount: 1, pointerType: 'mouse',
+          })
+          // Interpolate through intermediate positions
+          for (let i = 1; i <= steps; i++) {
+            const x = Math.round(command.startX + (command.endX - command.startX) * i / steps)
+            const y = Math.round(command.startY + (command.endY - command.startY) * i / steps)
+            await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+              type: 'mouseMoved', x, y, button: 'left', buttons: 1, pointerType: 'mouse',
+            })
           }
-          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { ...baseParams, type: 'mousePressed' })
-          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { ...baseParams, type: 'mouseReleased' })
-        } finally {
-          try { await chrome.debugger.detach(target) } catch { /* ignore */ }
-        }
+          // Release at end position
+          await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+            type: 'mouseReleased', x: command.endX, y: command.endY,
+            button: 'left', buttons: 0, clickCount: 1, pointerType: 'mouse',
+          })
+          return { success: true }
+        })
+      }
 
-        return { success: true }
+      case 'keyPress': {
+        const tab = await getTargetTab(command.tabId)
+        if (!tab) return { success: false, error: 'No active tab' }
+        // CDP modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8
+        const modifierMap = { alt: 1, ctrl: 2, control: 2, meta: 4, command: 4, shift: 8 }
+        const modifiers = (command.modifiers || []).reduce((acc, m) => acc | (modifierMap[m.toLowerCase()] || 0), 0)
+        const key = command.key || ''
+        // Map named keys to Windows virtual key codes for CDP
+        const keyCodeMap = {
+          Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, Space: 32,
+          ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+          Home: 36, End: 35, PageUp: 33, PageDown: 34,
+          F1: 112, F2: 113, F3: 114, F4: 115, F5: 116, F6: 117,
+          F7: 118, F8: 119, F9: 120, F10: 121, F11: 122, F12: 123,
+        }
+        const windowsVirtualKeyCode = keyCodeMap[key] ?? (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0)
+        return withDebugger(tab.id, async (target) => {
+          const params = { key, windowsVirtualKeyCode, modifiers, nativeVirtualKeyCode: windowsVirtualKeyCode }
+          await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { ...params, type: 'keyDown' })
+          await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { ...params, type: 'keyUp' })
+          return { success: true }
+        })
+      }
+
+      case 'getInputLog': {
+        const tab = await getTargetTab(command.tabId)
+        if (!tab) return { success: false, error: 'No active tab' }
+        const result = await sendToContentScript(tab.id, { action: 'getInputLog', clear: command.clear !== false })
+        return result
       }
 
       case 'clickRef': {

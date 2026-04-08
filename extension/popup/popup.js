@@ -1,65 +1,101 @@
-const statusEl = document.getElementById('status')
-const portEl = document.getElementById('port')
-const commandCountEl = document.getElementById('commandCount')
+const serversList = document.getElementById('servers-list')
+const addPortEl = document.getElementById('add-port')
+const addBtn = document.getElementById('add-btn')
 const errorEl = document.getElementById('error')
 
-function updateUI() {
-  // Read storage directly — bypasses sendMessage to diagnose whether the SW
-  // has ever run, independent of whether it's currently alive.
-  chrome.storage.local.get(['websterState', 'websterPort'], function (r) {
-    const state = r.websterState
-    // Port source of truth is websterPort, not websterState.port
-    const port = r.websterPort || (state && state.port) || 3456
+function renderServers(connections, primaryPort, extraPorts) {
+  const allPorts = [...new Set([primaryPort, ...extraPorts])]
+  serversList.innerHTML = ''
 
-    // Update port display from storage, but don't clobber while user is typing
-    if (portEl !== document.activeElement && portEl.value !== String(port)) {
-      portEl.value = port
-    }
+  for (const port of allPorts) {
+    const state = connections[port] || {}
+    const connected = state.connected || false
+    const cmds = state.commandsExecuted || 0
+    const isPrimary = port === primaryPort
 
-    if (!state) {
-      statusEl.textContent = 'Disconnected'
-      statusEl.className = 'status disconnected'
-      errorEl.textContent = 'Storage empty — SW has never run'
-      errorEl.hidden = false
-      return
-    }
+    const div = document.createElement('div')
+    div.className = 'server-row'
+    div.innerHTML = `
+      <div class="server-header">
+        <span class="status ${connected ? 'connected' : 'disconnected'}">${connected ? 'Connected' : 'Disconnected'}</span>
+        <span class="port-label">Port ${port}${isPrimary ? ' <em>(primary)</em>' : ''}</span>
+        ${!isPrimary ? `<button class="remove-btn" data-port="${port}">✕</button>` : ''}
+      </div>
+      <div class="server-stats">
+        <span class="stat-label">Commands</span>
+        <span class="stat-value">${cmds}</span>
+        ${isPrimary ? `<span class="stat-label" style="margin-left:8px">Port</span>
+        <input class="port-input" type="number" value="${port}" min="1" max="65535" data-port="${port}">` : ''}
+      </div>
+      ${state.lastError ? `<div class="server-error">${state.lastError}</div>` : ''}
+    `
+    serversList.appendChild(div)
+  }
 
-    commandCountEl.textContent = state.commandsExecuted || 0
+  // Attach events
+  serversList.querySelectorAll('.remove-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const port = Number(btn.dataset.port)
+      chrome.runtime.sendMessage({ type: 'REMOVE_SERVER', port }, () => {
+        if (chrome.runtime.lastError) { /* ignore */ }
+      })
+    })
+  })
 
-    if (state.connected) {
-      statusEl.textContent = 'Connected'
-      statusEl.className = 'status connected'
-    } else {
-      statusEl.textContent = 'Disconnected'
-      statusEl.className = 'status disconnected'
-    }
-
-    if (state.lastError) {
-      errorEl.textContent = state.lastError
-      errorEl.hidden = false
-    } else {
-      errorEl.hidden = true
-    }
+  let portDebounce = null
+  serversList.querySelectorAll('.port-input').forEach(input => {
+    input.addEventListener('input', () => {
+      clearTimeout(portDebounce)
+      portDebounce = setTimeout(() => {
+        const port = Number(input.value)
+        if (port > 0 && port < 65536) {
+          chrome.storage.local.set({ websterPort: port })
+          chrome.runtime.sendMessage({ type: 'SET_PORT', port }, () => {
+            if (chrome.runtime.lastError) { /* ignore */ }
+          })
+        }
+      }, 500)
+    })
   })
 }
 
-let portDebounce = null
-portEl.addEventListener('input', function () {
-  clearTimeout(portDebounce)
-  portDebounce = setTimeout(function () {
-    const port = Number(portEl.value)
-    if (port > 0 && port < 65536) {
-      try {
-        // Save immediately so updateUI reads the new value
-        chrome.storage.local.set({ websterPort: port })
-        chrome.runtime.sendMessage({ type: 'SET_PORT', port }, function () {
-          if (chrome.runtime.lastError) { /* ignore */ }
-        })
-      } catch (e) { /* ignore */ }
+function updateUI() {
+  chrome.runtime.sendMessage({ type: 'GET_STATE' }, (response) => {
+    if (chrome.runtime.lastError || !response) {
+      // SW not yet running — read storage directly
+      chrome.storage.local.get(['websterConnections', 'websterPort', 'websterExtraPorts'], (r) => {
+        const port = r.websterPort || 3456
+        const extra = r.websterExtraPorts || []
+        const conns = r.websterConnections || {}
+        renderServers(conns, port, extra)
+        if (!r.websterConnections) {
+          errorEl.textContent = 'Storage empty — SW has never run'
+          errorEl.hidden = false
+        } else {
+          errorEl.hidden = true
+        }
+      })
+      return
     }
-  }, 500)
+    errorEl.hidden = true
+    renderServers(response.connections, response.primaryPort, response.extraPorts)
+  })
+}
+
+addBtn.addEventListener('click', () => {
+  const port = Number(addPortEl.value)
+  if (port > 0 && port < 65536) {
+    chrome.runtime.sendMessage({ type: 'ADD_SERVER', port }, () => {
+      if (chrome.runtime.lastError) { /* ignore */ }
+    })
+    addPortEl.value = ''
+  }
 })
 
-// Render immediately, then poll for state
+addPortEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') addBtn.click()
+})
+
+// Render immediately, then poll
 updateUI()
 setInterval(updateUI, 2000)

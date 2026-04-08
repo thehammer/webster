@@ -11,6 +11,7 @@ script.onload = () => script.remove()
 // Pending resolve callbacks for page-script responses
 let pendingConsoleResolve = null
 let pendingNetworkResolve = null
+let pendingInputResolve = null
 
 window.addEventListener('message', (event) => {
   if (event.source !== window) return
@@ -21,6 +22,10 @@ window.addEventListener('message', (event) => {
   if (event.data?.type === 'WEBSTER_NETWORK_RESULT' && pendingNetworkResolve) {
     pendingNetworkResolve(event.data.entries)
     pendingNetworkResolve = null
+  }
+  if (event.data?.type === 'WEBSTER_INPUT_RESULT' && pendingInputResolve) {
+    pendingInputResolve(event.data.entries)
+    pendingInputResolve = null
   }
 })
 
@@ -40,6 +45,16 @@ function getNetworkEntries() {
     window.postMessage({ type: 'WEBSTER_READ_NETWORK' }, '*')
     setTimeout(() => {
       if (pendingNetworkResolve) { pendingNetworkResolve([]); pendingNetworkResolve = null }
+    }, 1000)
+  })
+}
+
+function getInputEntries(clear = true) {
+  return new Promise((resolve) => {
+    pendingInputResolve = resolve
+    window.postMessage({ type: 'WEBSTER_READ_INPUT', clear }, '*')
+    setTimeout(() => {
+      if (pendingInputResolve) { pendingInputResolve([]); pendingInputResolve = null }
     }, 1000)
   })
 }
@@ -147,6 +162,11 @@ async function handleCommand(cmd) {
 
       case 'getNetworkDetails': {
         const entries = await getNetworkEntries()
+        return { success: true, data: entries }
+      }
+
+      case 'getInputLog': {
+        const entries = await getInputEntries(cmd.clear !== false)
         return { success: true, data: entries }
       }
 

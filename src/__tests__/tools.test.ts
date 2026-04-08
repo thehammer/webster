@@ -7,6 +7,8 @@ const mockServer = {
   isConnected: () => true,
   getBrowsers: () => [],
   setBrowser: (_idOrName: string) => ({ id: 'test', browser: 'chrome', version: '1.0', transport: 'ws', active: true }),
+  claimTab: (_tabId: number | undefined) => ({ claimed: true, tabId: 1, owner: '3456:1234' }),
+  releaseTab: (_tabId: number | undefined) => undefined,
 } as unknown as WebsterServer
 
 const tools = createTools(mockServer)
@@ -48,15 +50,23 @@ const EXPECTED_TOOL_NAMES = [
   'start_capture',
   'stop_capture',
   'get_capture',
+  // Phase 10 — input dispatching & monitoring
+  'hover',
+  'drag',
+  'key_press',
+  'get_input_log',
+  // Phase 9 — concurrent sessions / tab ownership
+  'claim_tab',
+  'release_tab',
 ]
 
 describe('createTools', () => {
-  test('all 36 tools are present by name', () => {
+  test('all 42 tools are present by name', () => {
     const names = tools.map(t => t.name)
     for (const expected of EXPECTED_TOOL_NAMES) {
       expect(names).toContain(expected)
     }
-    expect(tools).toHaveLength(36)
+    expect(tools).toHaveLength(42)
   })
 
   test('all tools have description and inputSchema', () => {
@@ -131,10 +141,29 @@ describe('createTools', () => {
     expect(getAttr.inputSchema.required).toContain('attribute')
   })
 
+  test('hover requires x and y', () => {
+    const hover = tools.find(t => t.name === 'hover')!
+    expect(hover.inputSchema.required).toContain('x')
+    expect(hover.inputSchema.required).toContain('y')
+  })
+
+  test('drag requires startX, startY, endX, endY', () => {
+    const drag = tools.find(t => t.name === 'drag')!
+    expect(drag.inputSchema.required).toContain('startX')
+    expect(drag.inputSchema.required).toContain('startY')
+    expect(drag.inputSchema.required).toContain('endX')
+    expect(drag.inputSchema.required).toContain('endY')
+  })
+
+  test('key_press requires key', () => {
+    const kp = tools.find(t => t.name === 'key_press')!
+    expect(kp.inputSchema.required).toContain('key')
+  })
+
   test('tools with no required fields accept empty input', () => {
     const noRequiredTools = ['screenshot', 'get_tabs', 'get_network_log', 'wait_for_network_idle',
       'get_cookies', 'get_local_storage', 'read_console', 'get_page_info', 'read_page',
-      'read_html', 'scroll_to']
+      'read_html', 'scroll_to', 'get_input_log', 'claim_tab', 'release_tab']
     for (const name of noRequiredTools) {
       const tool = tools.find(t => t.name === name)!
       expect(tool, `${name} not found`).toBeTruthy()

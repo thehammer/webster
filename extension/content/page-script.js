@@ -139,6 +139,55 @@
     return origXHRSend.call(this, body)
   }
 
+  // ─── Input event capture ──────────────────────────────────────────────────
+  const inputBuffer = []
+  const MAX_INPUT = 200
+  let lastMouseMoveTime = 0
+  const MOUSEMOVE_THROTTLE_MS = 100 // max 10 events/s
+
+  function pushInput(entry) {
+    inputBuffer.push(entry)
+    if (inputBuffer.length > MAX_INPUT) inputBuffer.shift()
+  }
+
+  function inputModifiers(e) {
+    const mods = []
+    if (e.altKey) mods.push('alt')
+    if (e.ctrlKey) mods.push('ctrl')
+    if (e.metaKey) mods.push('meta')
+    if (e.shiftKey) mods.push('shift')
+    return mods
+  }
+
+  const MOUSE_BUTTONS = ['left', 'middle', 'right']
+
+  document.addEventListener('mousemove', (e) => {
+    const now = Date.now()
+    if (now - lastMouseMoveTime < MOUSEMOVE_THROTTLE_MS) return
+    lastMouseMoveTime = now
+    pushInput({ type: 'mousemove', x: e.clientX, y: e.clientY, t: now })
+  }, { capture: true, passive: true })
+
+  document.addEventListener('mousedown', (e) => {
+    pushInput({ type: 'mousedown', x: e.clientX, y: e.clientY, button: MOUSE_BUTTONS[e.button] ?? 'unknown', t: Date.now() })
+  }, { capture: true, passive: true })
+
+  document.addEventListener('mouseup', (e) => {
+    pushInput({ type: 'mouseup', x: e.clientX, y: e.clientY, button: MOUSE_BUTTONS[e.button] ?? 'unknown', t: Date.now() })
+  }, { capture: true, passive: true })
+
+  document.addEventListener('click', (e) => {
+    pushInput({ type: 'click', x: e.clientX, y: e.clientY, button: 'left', t: Date.now() })
+  }, { capture: true, passive: true })
+
+  document.addEventListener('keydown', (e) => {
+    pushInput({ type: 'keydown', key: e.key, modifiers: inputModifiers(e), t: Date.now() })
+  }, { capture: true, passive: true })
+
+  document.addEventListener('keyup', (e) => {
+    pushInput({ type: 'keyup', key: e.key, modifiers: inputModifiers(e), t: Date.now() })
+  }, { capture: true, passive: true })
+
   // ─── Message handler ──────────────────────────────────────────────────────
   window.addEventListener('message', (event) => {
     if (event.source !== window) return
@@ -153,6 +202,13 @@
       const entries = [...networkBuffer]
       networkBuffer.length = 0
       window.postMessage({ type: 'WEBSTER_NETWORK_RESULT', entries }, '*')
+    }
+
+    if (event.data?.type === 'WEBSTER_READ_INPUT') {
+      const clear = event.data.clear !== false
+      const entries = [...inputBuffer]
+      if (clear) inputBuffer.length = 0
+      window.postMessage({ type: 'WEBSTER_INPUT_RESULT', entries }, '*')
     }
   })
 })()

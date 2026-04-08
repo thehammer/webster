@@ -34,7 +34,13 @@ Comparison of Webster (open source, multi-browser MCP server) against Anthropic'
 | **Headless / CI use** | ⚠️ Possible but not designed for it | ❌ |
 | **Transport control** | ✅ Configurable, open source | ❌ Fixed |
 | **Maintenance burden** | ⚠️ You own it | ✅ Anthropic maintains it |
-| **Total tools** | 36 | ~18 |
+| **Hover / mouse move** | ✅ `hover` | ❌ |
+| **Drag-and-drop (mouse)** | ✅ `drag` | ❌ |
+| **Keyboard key press** | ✅ `key_press` (+ modifiers) | ⚠️ Via type/form input |
+| **Input event monitoring** | ✅ `get_input_log` | ❌ |
+| **Concurrent session support** | ✅ Multi-server, `claim_tab`/`release_tab` | ❌ Single session |
+| **Server registry** | ✅ `~/.webster/registry.json` | ❌ |
+| **Total tools** | 42 | ~18 |
 
 ---
 
