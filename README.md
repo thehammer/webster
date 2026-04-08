@@ -121,7 +121,6 @@ Then enable Webster in Safari → Settings → Extensions.
 The extension auto-connects to the server on port 3456. The popup shows connection status and lets you add additional server ports for concurrent sessions.
 
 ### 3. Install the menu bar app (optional, macOS)
-
 ```bash
 ./scripts/install-menubar.sh
 ```
@@ -155,6 +154,7 @@ Captures include:
 Data streams from the extension to the server in real-time — resilient to browser extension restarts. Stored on disk under `~/.webster/captures/`.
 
 ### Replay viewer
+<img width="1542" height="717" alt="Screenshot 2026-04-08 at 3 59 10 PM" src="https://github.com/user-attachments/assets/f94ca695-a3a9-4ffd-8b70-5ae84154133a" />
 
 Open `http://localhost:3456/replay/{sessionId}` to view a captured session:
 
@@ -167,6 +167,7 @@ Open `http://localhost:3456/replay/{sessionId}` to view a captured session:
 - Keyboard controls: Space (play/pause), arrows (seek), < > (speed)
 
 ### Web dashboard
+<img width="963" height="494" alt="Screenshot 2026-04-08 at 3 59 31 PM" src="https://github.com/user-attachments/assets/29cf0bcc-1ffe-47e6-b886-0f25f4caa7ad" />
 
 Open `http://localhost:3456/dashboard` for a web UI with:
 
@@ -177,6 +178,7 @@ Open `http://localhost:3456/dashboard` for a web UI with:
 - Delete and rename sessions
 
 ### Menu bar app
+<img width="579" height="269" alt="Screenshot 2026-04-08 at 3 59 51 PM" src="https://github.com/user-attachments/assets/deba8b0f-65f0-433b-bc03-9be98211026b" />
 
 The macOS menu bar app provides:
 
