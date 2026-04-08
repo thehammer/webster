@@ -18,6 +18,7 @@ script.onload = () => script.remove()
 let pendingConsoleResolve = null
 let pendingNetworkResolve = null
 let pendingInputResolve = null
+let pendingDrainResolve = null
 
 window.addEventListener('message', (event) => {
   if (event.source !== window) return
@@ -32,6 +33,15 @@ window.addEventListener('message', (event) => {
   if (event.data?.type === 'WEBSTER_INPUT_RESULT' && pendingInputResolve) {
     pendingInputResolve(event.data.entries)
     pendingInputResolve = null
+  }
+  if (event.data?.type === 'WEBSTER_DRAIN_CAPTURE_RESULT' && pendingDrainResolve) {
+    pendingDrainResolve({
+      input: event.data.input,
+      console: event.data.console,
+      errors: event.data.errors,
+      page: event.data.page,
+    })
+    pendingDrainResolve = null
   }
 })
 
@@ -177,6 +187,24 @@ async function handleCommand(cmd) {
           hideCursor: cmd.hideCursor,
         })
         return { success: true, data: entries }
+      }
+
+      case 'drainCapture': {
+        const data = await new Promise((resolve) => {
+          pendingDrainResolve = resolve
+          window.postMessage({
+            type: 'WEBSTER_DRAIN_CAPTURE',
+            showCursor: cmd.showCursor,
+            hideCursor: cmd.hideCursor,
+          }, '*')
+          setTimeout(() => {
+            if (pendingDrainResolve) {
+              pendingDrainResolve({ input: [], console: [], errors: [], page: null })
+              pendingDrainResolve = null
+            }
+          }, 1500)
+        })
+        return { success: true, data }
       }
 
       case 'showCursor': {

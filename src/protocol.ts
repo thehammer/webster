@@ -19,7 +19,7 @@ export interface WsEvent {
 
 export interface WsCaptureEvent {
   type: 'capture_event'
-  kind: 'network' | 'input' | 'frame'
+  kind: 'network' | 'input' | 'frame' | 'console' | 'page'
   data: Record<string, unknown>
 }
 

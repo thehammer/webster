@@ -5,7 +5,7 @@ import { homedir } from 'os'
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface CaptureEvent {
-  kind: 'network' | 'input'
+  kind: 'network' | 'input' | 'console' | 'page'
   timestamp: number
   [key: string]: unknown
 }
@@ -23,7 +23,7 @@ export interface CaptureSnapshot {
   duration: string
   eventCount: number
   frameCount: number
-  breakdown: { network: number; input: number }
+  breakdown: { network: number; input: number; console: number; page: number }
   topUrls: string[]
   config: CaptureConfig
 }
@@ -45,6 +45,8 @@ export class CaptureSession {
   private eventCount = 0
   private networkCount = 0
   private inputCount = 0
+  private consoleCount = 0
+  private pageCount = 0
   private frameCount = 0
   private networkUrls: string[] = [] // track for topUrls summary
   private startedAt: number
@@ -89,6 +91,10 @@ export class CaptureSession {
       }
     } else if (event.kind === 'input') {
       this.inputCount++
+    } else if (event.kind === 'console') {
+      this.consoleCount++
+    } else if (event.kind === 'page') {
+      this.pageCount++
     }
   }
 
@@ -129,7 +135,7 @@ export class CaptureSession {
       duration,
       eventCount: this.eventCount,
       frameCount: this.frameCount,
-      breakdown: { network: this.networkCount, input: this.inputCount },
+      breakdown: { network: this.networkCount, input: this.inputCount, console: this.consoleCount, page: this.pageCount },
       topUrls,
       config: this.config,
     }
@@ -139,7 +145,7 @@ export class CaptureSession {
    * Read events from the JSONL file, with optional filtering.
    */
   readEvents(options?: {
-    kind?: 'network' | 'input'
+    kind?: 'network' | 'input' | 'console' | 'page'
     urlFilter?: string
     offset?: number
     limit?: number

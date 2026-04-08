@@ -238,10 +238,10 @@ function finalizeEntry(key, entry) {
   pushToServer({ type: 'capture_event', kind: 'network', data: entry })
 }
 
-// Drain input events from all captured tabs and stream them to the server.
+// Drain all capture data from all captured tabs and stream to server.
+// Collects input events, console output, JS errors, and page state in one round-trip.
 // Each tab gets a 1.5s budget — if the content script doesn't respond, skip it.
-// On the first drain when recording frames, piggybacks showCursor to enable the DOM cursor overlay.
-async function drainInputEvents() {
+async function drainCaptureData() {
   if (!captureInputEnabled || !captureActive) return
   const wantCursor = captureRecordingFrames
   if (wantCursor) captureCursorShown = true
@@ -250,14 +250,17 @@ async function drainInputEvents() {
     try {
       const result = await withTimeout(
         sendToContentScript(tabId, {
-          action: 'getInputLog',
-          clear: true,
+          action: 'drainCapture',
           ...(wantCursor ? { showCursor: true } : {}),
         }),
         1500
       )
-      if (result?.success && Array.isArray(result.data)) {
-        for (const evt of result.data) {
+      if (!result?.success || !result.data) return
+      const { input, console: consoleLogs, errors, page } = result.data
+
+      // Stream input events
+      if (Array.isArray(input)) {
+        for (const evt of input) {
           pushToServer({
             type: 'capture_event',
             kind: 'input',
@@ -275,6 +278,63 @@ async function drainInputEvents() {
           })
         }
       }
+
+      // Stream console events
+      if (Array.isArray(consoleLogs)) {
+        for (const entry of consoleLogs) {
+          pushToServer({
+            type: 'capture_event',
+            kind: 'console',
+            data: {
+              tabId,
+              level: entry.level,
+              text: entry.text,
+              timestamp: new Date(entry.time).getTime(),
+              time: entry.time,
+            },
+          })
+        }
+      }
+
+      // Stream JS errors
+      if (Array.isArray(errors)) {
+        for (const err of errors) {
+          pushToServer({
+            type: 'capture_event',
+            kind: 'console',
+            data: {
+              tabId,
+              level: err.level,
+              text: err.text,
+              source: err.source,
+              line: err.line,
+              col: err.col,
+              stack: err.stack,
+              timestamp: err.t,
+              time: err.time,
+            },
+          })
+        }
+      }
+
+      // Stream page state snapshot
+      if (page) {
+        pushToServer({
+          type: 'capture_event',
+          kind: 'page',
+          data: {
+            tabId,
+            url: page.url,
+            title: page.title,
+            scrollX: page.scrollX,
+            scrollY: page.scrollY,
+            viewportWidth: page.viewportWidth,
+            viewportHeight: page.viewportHeight,
+            timestamp: page.t,
+            time: new Date(page.t).toISOString(),
+          },
+        })
+      }
     } catch {
       // Tab closed, content script not injected, or timed out — skip
     }
@@ -289,7 +349,7 @@ function startInputDraining() {
   // Use self-scheduling setTimeout chain (not setInterval) for MV3 safety.
   function drainLoop() {
     if (!captureInputEnabled || !captureActive) return
-    drainInputEvents()
+    drainCaptureData()
       .catch(() => {})
       .finally(() => {
         if (captureInputEnabled && captureActive) {
@@ -964,11 +1024,11 @@ export async function executeCommand(command) {
           recordingActive = false
           recordingFrames = []
           captureRecordingFrames = false
-          // Hide cursor overlay by piggybacking on a final input drain
+          // Hide cursor overlay via a final drain (also flushes remaining events)
           if (captureCursorShown) {
             const allTabs = [...capturedTabs]
             await Promise.allSettled(allTabs.map(tabId =>
-              sendToContentScript(tabId, { action: 'getInputLog', clear: true, hideCursor: true }).catch(() => {})
+              sendToContentScript(tabId, { action: 'drainCapture', hideCursor: true }).catch(() => {})
             ))
             captureCursorShown = false
           }

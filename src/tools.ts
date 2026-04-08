@@ -484,7 +484,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
         type: 'object',
         properties: {
           events: { type: 'boolean', description: 'Include the full event list (default: false, returns summary only)' },
-          kind: { type: 'string', enum: ['network', 'input'], description: 'Filter events by kind' },
+          kind: { type: 'string', enum: ['network', 'input', 'console', 'page'], description: 'Filter events by kind' },
           urlFilter: { type: 'string', description: 'Filter network events by URL substring' },
           event: { type: 'number', description: 'Return a single event by index (0-based)' },
           offset: { type: 'number', description: 'Skip first N events (for pagination)' },

@@ -182,6 +182,36 @@
     cursorOverlay.style.top = y + 'px'
   }
 
+  // ─── JS error capture ─────────────────────────────────────────────────────
+  const errorBuffer = []
+  const MAX_ERRORS = 50
+
+  window.addEventListener('error', (e) => {
+    errorBuffer.push({
+      level: 'exception',
+      text: e.message || String(e),
+      source: e.filename || null,
+      line: e.lineno || null,
+      col: e.colno || null,
+      stack: e.error?.stack || null,
+      time: new Date().toISOString(),
+      t: Date.now(),
+    })
+    if (errorBuffer.length > MAX_ERRORS) errorBuffer.shift()
+  })
+
+  window.addEventListener('unhandledrejection', (e) => {
+    const reason = e.reason
+    errorBuffer.push({
+      level: 'unhandledrejection',
+      text: reason?.message || String(reason),
+      stack: reason?.stack || null,
+      time: new Date().toISOString(),
+      t: Date.now(),
+    })
+    if (errorBuffer.length > MAX_ERRORS) errorBuffer.shift()
+  })
+
   // ─── Input event capture ──────────────────────────────────────────────────
   const inputBuffer = []
   const MAX_INPUT = 200
@@ -260,6 +290,40 @@
         hideCursorOverlay()
       }
       window.postMessage({ type: 'WEBSTER_INPUT_RESULT', entries }, '*')
+    }
+
+    // Unified drain for capture sessions — returns all buffered data + page state in one message
+    if (event.data?.type === 'WEBSTER_DRAIN_CAPTURE') {
+      const input = [...inputBuffer]
+      inputBuffer.length = 0
+
+      const console_ = [...consoleBuffer]
+      consoleBuffer.length = 0
+
+      const errors = [...errorBuffer]
+      errorBuffer.length = 0
+
+      const page = {
+        url: location.href,
+        title: document.title,
+        scrollX: window.scrollX,
+        scrollY: window.scrollY,
+        viewportWidth: window.innerWidth,
+        viewportHeight: window.innerHeight,
+        t: Date.now(),
+      }
+
+      if (event.data.showCursor && !cursorOverlay) {
+        showCursorOverlay()
+      }
+      if (event.data.hideCursor) {
+        hideCursorOverlay()
+      }
+
+      window.postMessage({
+        type: 'WEBSTER_DRAIN_CAPTURE_RESULT',
+        input, console: console_, errors, page,
+      }, '*')
     }
 
     if (event.data?.type === 'WEBSTER_SHOW_CURSOR') {
