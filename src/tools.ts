@@ -6,9 +6,11 @@ interface WebsterTool extends Tool {
 }
 
 export function createTools(server: WebsterServer): WebsterTool[] {
-  function dispatch(action: string, params: Record<string, unknown> = {}): Promise<unknown> {
-    return server.dispatch({ action, ...params })
+  function dispatch(action: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<unknown> {
+    return server.dispatch({ action, ...params }, timeoutMs)
   }
+
+  const CAPTURE_TIMEOUT = 60000 // 60s — capture setup touches every tab
 
   return [
     {
@@ -477,7 +479,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
           gifFps: { type: 'number', description: 'Frames per second for GIF recording (default: 2). Only used when recordGif is true.' },
         },
       },
-      execute: (input) => dispatch('startCapture', input),
+      execute: (input) => dispatch('startCapture', input, CAPTURE_TIMEOUT),
     },
 
     {
@@ -490,7 +492,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
         },
       },
       execute: async (input) => {
-        const result = await dispatch('stopCapture') as { events: unknown[]; frames?: { dataUrl: string; timestamp: number }[] }
+        const result = await dispatch('stopCapture', {}, CAPTURE_TIMEOUT) as { events: unknown[]; frames?: { dataUrl: string; timestamp: number }[] }
         if (result?.frames?.length) {
           const { encodeGif } = await import('./gif.js')
           const gif = await encodeGif(result.frames, (input as { gifFps?: number }).gifFps ?? 2)
@@ -507,7 +509,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
         type: 'object',
         properties: {},
       },
-      execute: () => dispatch('getCapture'),
+      execute: () => dispatch('getCapture', {}, CAPTURE_TIMEOUT),
     },
 
     {

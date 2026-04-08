@@ -77,16 +77,8 @@ async function attachDebuggerToTab(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId)
     if (!isDebugable(tab.url)) return
-    await withTimeout(chrome.debugger.attach({ tabId }, '1.3'), 5000)
-    await withTimeout(chrome.debugger.sendCommand({ tabId }, 'Network.enable', {}), 5000)
-    // Auto-attach to popups/new windows opened from this tab
-    try {
-      await withTimeout(chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', {
-        autoAttach: true,
-        waitForDebuggerOnStart: false,
-        flatten: true,
-      }), 5000)
-    } catch { /* Target.setAutoAttach may not be supported in all browsers */ }
+    await withTimeout(chrome.debugger.attach({ tabId }, '1.3'), 3000)
+    await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
     capturedTabs.add(tabId)
   } catch (e) {
     // Already attached, not debuggable, or timed out — skip
@@ -238,12 +230,17 @@ function finalizeEntry(key, entry) {
   if (captureBuffer.length > MAX_CAPTURE_ENTRIES) captureBuffer.shift()
 }
 
-// Drain input events from all captured tabs into the capture buffer
+// Drain input events from all captured tabs into the capture buffer.
+// Each tab gets a 1.5s budget — if the content script doesn't respond, skip it.
 async function drainInputEvents() {
   if (!captureInputEnabled || !captureActive) return
-  for (const tabId of capturedTabs) {
+  const tabs = [...capturedTabs]
+  await Promise.allSettled(tabs.map(async (tabId) => {
     try {
-      const result = await sendToContentScript(tabId, { action: 'getInputLog', clear: true })
+      const result = await withTimeout(
+        sendToContentScript(tabId, { action: 'getInputLog', clear: true }),
+        1500
+      )
       if (result?.success && Array.isArray(result.data)) {
         for (const evt of result.data) {
           captureBuffer.push({
@@ -262,15 +259,17 @@ async function drainInputEvents() {
         }
       }
     } catch {
-      // Tab may have closed or content script not injected — skip
+      // Tab closed, content script not injected, or timed out — skip
     }
-  }
+  }))
 }
 
 function startInputDraining() {
   stopInputDraining()
   captureInputEnabled = true
-  captureInputInterval = setInterval(drainInputEvents, INPUT_DRAIN_INTERVAL_MS)
+  // Don't use setInterval — periodic drains crash the MV3 service worker.
+  // Input events accumulate in page-script buffers and are drained on
+  // get_capture / stop_capture instead.
 }
 
 function stopInputDraining() {
@@ -854,36 +853,37 @@ export async function executeCommand(command) {
           chrome.webNavigation.onBeforeNavigate.addListener(onCaptureNavigation)
         }
 
-        // Attach to all existing tabs in parallel (sequential was causing 30s timeout)
+        // Attach debugger + inject input scripts in one parallel pass per tab.
+        // Each tab gets an 8s budget — if attach or injection stalls, skip it.
         const allTabs = await chrome.tabs.query({})
-        await Promise.allSettled(allTabs.map(tab => attachDebuggerToTab(tab.id)))
-
-        // Start draining input events if requested
-        if (command.includeInput) {
-          // Inject content + page scripts into already-open tabs so input listeners are active.
-          // Content scripts only auto-inject on new page loads (document_idle), so tabs that
-          // were open before capture started won't have them yet.
-          await Promise.allSettled([...capturedTabs].map(async (tabId) => {
+        const wantInput = !!command.includeInput
+        await Promise.allSettled(allTabs.map(tab => withTimeout((async () => {
+          await attachDebuggerToTab(tab.id)
+          // Ensure content + page scripts are present for input capture.
+          // The manifest auto-injects on new page loads, but tabs open before
+          // the extension loaded (or before this capture started) may not have them.
+          if (wantInput && capturedTabs.has(tab.id)) {
             try {
-              // Inject page script (MAIN world) first — captures input events
               await chrome.scripting.executeScript({
-                target: { tabId },
+                target: { tabId: tab.id },
                 world: 'MAIN',
                 files: ['content/page-script.js'],
               })
-              // Inject content script (ISOLATED world) — bridges page script to service worker
               await chrome.scripting.executeScript({
-                target: { tabId },
+                target: { tabId: tab.id },
                 files: ['content/content-script.js'],
               })
-            } catch {
-              // Tab may not support script injection (e.g. PDF viewer) — skip
-            }
-          }))
+            } catch { /* tab may not support script injection — skip */ }
+          }
+        })(), 8000)))
+
+        if (wantInput) {
           startInputDraining()
         }
 
-        // Start GIF recording if requested
+        // Start GIF recording if requested.
+        // Uses a self-scheduling setTimeout chain instead of setInterval —
+        // setInterval with async callbacks crashes MV3 service workers.
         if (command.recordGif) {
           const tab = await getTargetTab(command.tabId)
           if (tab) {
@@ -891,14 +891,21 @@ export async function executeCommand(command) {
             recordingFrames = []
             recordingActive = true
             const intervalMs = Math.round(1000 / (command.gifFps || 2))
-            if (recordingInterval) clearInterval(recordingInterval)
-            recordingInterval = setInterval(async () => {
+            if (recordingInterval) clearTimeout(recordingInterval)
+            function captureFrame() {
               if (!recordingActive) return
-              try {
-                const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
-                recordingFrames.push({ dataUrl, timestamp: Date.now() })
-              } catch { /* tab may have navigated, skip frame */ }
-            }, intervalMs)
+              chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 30 })
+                .then((dataUrl) => {
+                  recordingFrames.push({ dataUrl, timestamp: Date.now() })
+                })
+                .catch(() => { /* tab may have navigated, skip frame */ })
+                .finally(() => {
+                  if (recordingActive) {
+                    recordingInterval = setTimeout(captureFrame, intervalMs)
+                  }
+                })
+            }
+            recordingInterval = setTimeout(captureFrame, intervalMs)
           }
         }
 
@@ -906,28 +913,26 @@ export async function executeCommand(command) {
       }
 
       case 'stopCapture': {
-        // Final drain of input events before stopping
-        if (captureInputEnabled) {
-          await drainInputEvents()
-        }
+        // ZERO awaits in this handler — MV3 service workers die at any await point.
+        // Input events accumulated in the buffer during the capture session are included as-is.
         stopInputDraining()
-
         captureActive = false
         chrome.tabs.onCreated.removeListener(onCaptureTabCreated)
         if (chrome.webNavigation) {
           chrome.webNavigation.onBeforeNavigate.removeListener(onCaptureNavigation)
         }
 
-        // Detach debugger from all tabs
-        for (const tabId of capturedTabs) {
-          await detachDebuggerFromTab(tabId)
+        // Stop GIF recording
+        let frames = null
+        if (recordingActive) {
+          if (recordingInterval) { clearInterval(recordingInterval); recordingInterval = null }
+          recordingActive = false
+          frames = recordingFrames.slice()
+          recordingFrames = []
         }
 
-        // Wait a moment for any in-flight getResponseBody calls to complete
-        await new Promise(r => setTimeout(r, 500))
-
         // Flush any remaining pending entries (incomplete requests)
-        for (const [requestId, entry] of capturePending) {
+        for (const [, entry] of capturePending) {
           entry._ts = cdpTimestampToEpochMs(entry._startTimestamp)
           delete entry._startTimestamp
           delete entry._requestId
@@ -937,23 +942,22 @@ export async function executeCommand(command) {
         }
         capturePending.clear()
 
-        // Stop GIF recording if it was running
-        let frames = null
-        if (recordingActive) {
-          if (recordingInterval) { clearInterval(recordingInterval); recordingInterval = null }
-          recordingActive = false
-          frames = recordingFrames.slice()
-          recordingFrames = []
-        }
-
         // Sort by timestamp for unified time-series
         const result = [...captureBuffer].sort((a, b) => (a._ts || 0) - (b._ts || 0))
-        // Clean up internal fields
         result.forEach(e => delete e._ts)
         captureBuffer = []
 
         const response = { events: result }
         if (frames) response.frames = frames
+
+        // Schedule debugger detach for after the response is sent back over WS.
+        // Using setTimeout ensures the WS send completes before we touch the debugger.
+        const tabsToDetach = [...capturedTabs]
+        capturedTabs.clear()
+        setTimeout(() => {
+          Promise.allSettled(tabsToDetach.map(tabId => detachDebuggerFromTab(tabId))).catch(() => {})
+        }, 100)
+
         return { success: true, data: response }
       }
 
@@ -981,7 +985,7 @@ export async function executeCommand(command) {
 
       case 'startRecording': {
         if (recordingActive) {
-          clearInterval(recordingInterval)
+          clearTimeout(recordingInterval)
         }
         const tab = await getTargetTab(command.tabId)
         if (!tab) return { success: false, error: 'No active tab' }
@@ -989,18 +993,25 @@ export async function executeCommand(command) {
         recordingFrames = []
         recordingActive = true
         const intervalMs = Math.round(1000 / (command.fps || 2))
-        recordingInterval = setInterval(async () => {
+        function captureRecordingFrame() {
           if (!recordingActive) return
-          try {
-            const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: 'png' })
-            recordingFrames.push({ dataUrl, timestamp: Date.now() })
-          } catch { /* tab may have navigated, skip frame */ }
-        }, intervalMs)
+          chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 30 })
+            .then((dataUrl) => {
+              recordingFrames.push({ dataUrl, timestamp: Date.now() })
+            })
+            .catch(() => { /* tab may have navigated, skip frame */ })
+            .finally(() => {
+              if (recordingActive) {
+                recordingInterval = setTimeout(captureRecordingFrame, intervalMs)
+              }
+            })
+        }
+        recordingInterval = setTimeout(captureRecordingFrame, intervalMs)
         return { success: true }
       }
 
       case 'stopRecording': {
-        if (recordingInterval) { clearInterval(recordingInterval); recordingInterval = null }
+        if (recordingInterval) { clearTimeout(recordingInterval); recordingInterval = null }
         recordingActive = false
         const frames = recordingFrames.slice()
         recordingFrames = []
@@ -1008,7 +1019,7 @@ export async function executeCommand(command) {
       }
 
       case 'clearRecording': {
-        if (recordingInterval) { clearInterval(recordingInterval); recordingInterval = null }
+        if (recordingInterval) { clearTimeout(recordingInterval); recordingInterval = null }
         recordingActive = false
         recordingFrames = []
         return { success: true }

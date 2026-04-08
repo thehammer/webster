@@ -2,6 +2,12 @@
 // Runs in isolated world. Injects page-script.js into MAIN world for console
 // and network capture.
 
+// Guard against double-injection (manifest auto-inject + programmatic inject)
+if (window.__websterContentScriptLoaded) {
+  // Already loaded — skip re-initialization
+} else {
+window.__websterContentScriptLoaded = true
+
 // Inject page script for console and network interception
 const script = document.createElement('script')
 script.src = chrome.runtime.getURL('content/page-script.js')
@@ -193,3 +199,5 @@ async function handleCommand(cmd) {
     return { success: false, error: String(err) }
   }
 }
+
+} // end guard

@@ -25,16 +25,20 @@ async function encodeWithFfmpeg(
   await fs.mkdir(dir, { recursive: true })
 
   try {
+    // Detect format from the first frame's data URL (could be png or jpeg)
+    const firstUrl = frames[0].dataUrl
+    const ext = firstUrl.startsWith('data:image/jpeg') ? 'jpg' : 'png'
+
     for (let i = 0; i < frames.length; i++) {
       const base64 = frames[i].dataUrl.replace(/^data:image\/\w+;base64,/, '')
-      await fs.writeFile(join(dir, `frame${String(i).padStart(4, '0')}.png`), Buffer.from(base64, 'base64'))
+      await fs.writeFile(join(dir, `frame${String(i).padStart(4, '0')}.${ext}`), Buffer.from(base64, 'base64'))
     }
 
     const outPath = join(dir, 'out.gif')
     const proc = Bun.spawn([
       'ffmpeg', '-y',
       '-framerate', String(fps),
-      '-i', join(dir, 'frame%04d.png'),
+      '-i', join(dir, `frame%04d.${ext}`),
       '-vf', `fps=${fps},scale=iw:ih:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`,
       outPath,
     ], { stderr: 'pipe' })

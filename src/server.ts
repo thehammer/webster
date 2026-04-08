@@ -337,7 +337,7 @@ export class WebsterServer {
     }
   }
 
-  dispatch(command: Omit<WsCommand, 'id'>): Promise<unknown> {
+  dispatch(command: Omit<WsCommand, 'id'>, timeoutMs?: number): Promise<unknown> {
     let ext: ConnectedExtension
     try {
       ext = this.getActiveExtension()
@@ -347,13 +347,14 @@ export class WebsterServer {
 
     const id = crypto.randomUUID() as string
     const msg: WsCommand = { id, ...command } as WsCommand
+    const timeout = timeoutMs ?? this.commandTimeout
 
     return new Promise((resolve, reject) => {
       const timeoutHandle = setTimeout(() => {
         this.pending.delete(id)
         this.httpResultHandlers.delete(id)
-        reject(new Error('Command timed out after 30s'))
-      }, this.commandTimeout)
+        reject(new Error(`Command timed out after ${Math.round(timeout / 1000)}s`))
+      }, timeout)
 
       this.pending.set(id, { resolve, reject, timeoutHandle })
 

@@ -106,7 +106,7 @@ describe('WebsterServer', () => {
     ws.onmessage = () => {}
 
     await expect(server.dispatch({ action: 'navigate', url: 'https://example.com' }))
-      .rejects.toThrow('Command timed out after 30s')
+      .rejects.toThrow('Command timed out after')
 
     ws.close()
   }, 2000)

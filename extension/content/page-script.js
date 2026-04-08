@@ -2,6 +2,9 @@
 // network interception (fetch + XHR). Communicates with content-script via
 // window.postMessage using WEBSTER_* message types.
 ;(function () {
+  // Guard against double-injection
+  if (window.__websterPageScriptLoaded) return
+  window.__websterPageScriptLoaded = true
   // ─── Console capture ──────────────────────────────────────────────────────
   const consoleBuffer = []
   const MAX_CONSOLE = 200
