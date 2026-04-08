@@ -1,9 +1,10 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 import { isResult, isCaptureEvent, isCaptureDone, type WsCommand, type WsMessage } from './protocol.js'
 import { CaptureSession, cleanOldSessions, CAPTURES_DIR, type CaptureConfig, type CaptureEvent } from './capture.js'
 import { handleReplayRequest } from './replay.js'
+import { buildDashboardHtml } from './dashboard.js'
 
 // ─── Registry ─────────────────────────────────────────────────────────────────
 // Each Webster server process registers itself so concurrent sessions can
@@ -74,6 +75,7 @@ export class WebsterServer {
 
   // Active capture session — receives push events from extension
   private captureSession: CaptureSession | null = null
+  private startedAt = Date.now()
 
   constructor(port: number, commandTimeout = 30000) {
     this.commandTimeout = commandTimeout
@@ -194,6 +196,81 @@ export class WebsterServer {
     if (req.method === 'GET' && url.pathname === '/registry') {
       const entries = readRegistry().filter(e => isProcessAlive(e.pid))
       return Response.json(entries)
+    }
+
+    // ─── Dashboard & API ──────────────────────────────────────────────────
+
+    if (req.method === 'GET' && url.pathname === '/dashboard') {
+      return new Response(buildDashboardHtml(this.port), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      })
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/status') {
+      const uptime = Date.now() - this.startedAt
+      const sec = Math.round(uptime / 1000)
+      const uptimeStr = sec < 60 ? `${sec}s` : sec < 3600 ? `${Math.floor(sec / 60)}m` : `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`
+      const snap = this.captureSession?.active ? this.captureSession.getSnapshot() : null
+      return Response.json({
+        running: true,
+        uptime: uptimeStr,
+        pid: process.pid,
+        port: this.port,
+        extensions: this.getBrowsers(),
+        capture: snap ? { active: true, sessionId: snap.sessionId, duration: snap.duration, eventCount: snap.eventCount, frameCount: snap.frameCount } : { active: false },
+        sessionCount: this.countSessions(),
+      })
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/sessions') {
+      return Response.json(this.listSessions())
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/capture/start') {
+      let body: Record<string, unknown> = {}
+      try { body = await req.json() as Record<string, unknown> } catch { /* empty config */ }
+      const config: CaptureConfig = {
+        urlFilter: (body.urlFilter as string) || null,
+        includeInput: !!body.includeInput,
+        recordFrames: !!body.recordFrames,
+        fps: (body.fps as number) || 2,
+      }
+      const session = this.startCaptureSession(config)
+      try {
+        await this.dispatch({
+          action: 'startCapture',
+          ...body,
+          streamToServer: true,
+        }, 60000)
+      } catch (e) {
+        return Response.json({ error: String(e) }, { status: 500 })
+      }
+      return Response.json(session.getSnapshot())
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/capture/stop') {
+      try {
+        await this.dispatch({ action: 'stopCapture' }, 60000)
+      } catch { /* extension may be gone — finalize anyway */ }
+      const session = this.stopCaptureSession()
+      if (!session) return Response.json({ error: 'No active capture' }, { status: 400 })
+      return Response.json(session.getSnapshot())
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/capture/current') {
+      const snap = this.captureSession?.active ? this.captureSession.getSnapshot() : null
+      if (!snap) return Response.json({ active: false })
+      return Response.json(snap)
+    }
+
+    if (req.method === 'DELETE' && url.pathname.startsWith('/api/sessions/')) {
+      const id = url.pathname.slice('/api/sessions/'.length)
+      if (!/^[0-9a-f-]{36}$/.test(id)) return new Response('Invalid ID', { status: 400 })
+      const dir = join(CAPTURES_DIR, id)
+      if (!existsSync(dir)) return new Response('Not found', { status: 404 })
+      const { rmSync } = await import('fs')
+      rmSync(dir, { recursive: true, force: true })
+      return new Response(null, { status: 204 })
     }
 
     // Replay viewer
@@ -480,6 +557,39 @@ export class WebsterServer {
     } else if (isCaptureDone(msg)) {
       this.captureSession.finalize()
     }
+  }
+
+  // ─── Session listing ──────────────────────────────────────────────────
+
+  private countSessions(): number {
+    if (!existsSync(CAPTURES_DIR)) return 0
+    return readdirSync(CAPTURES_DIR).filter(e => existsSync(join(CAPTURES_DIR, e, 'meta.json'))).length
+  }
+
+  private listSessions(): Array<Record<string, unknown>> {
+    if (!existsSync(CAPTURES_DIR)) return []
+    const entries = readdirSync(CAPTURES_DIR)
+    const sessions: Array<Record<string, unknown>> = []
+    for (const entry of entries) {
+      const metaPath = join(CAPTURES_DIR, entry, 'meta.json')
+      if (!existsSync(metaPath)) continue
+      try {
+        const meta = JSON.parse(readFileSync(metaPath, 'utf-8'))
+        const port = Number(process.env.WEBSTER_PORT ?? 3456)
+        meta.replayUrl = `http://localhost:${port}/replay/${entry}`
+        // Mark stale "active" sessions — if it's not the current live capture, it's abandoned
+        if (meta.status === 'active' && meta.id !== this.captureSession?.id) {
+          meta.status = 'abandoned'
+        }
+        sessions.push(meta)
+      } catch { /* skip corrupt sessions */ }
+    }
+    sessions.sort((a, b) => {
+      const ta = new Date(a.startedAt as string).getTime() || 0
+      const tb = new Date(b.startedAt as string).getTime() || 0
+      return tb - ta
+    })
+    return sessions
   }
 
   close(): void {
