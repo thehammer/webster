@@ -24,25 +24,43 @@ function matchesCaptureFilter(url) {
   return url.toLowerCase().includes(captureUrlFilter.toLowerCase())
 }
 
+// Tabs with these URL schemes can't be debugged — attach will hang or throw
+const UNDEBUGABLE_SCHEMES = [
+  'chrome://', 'chrome-extension://', 'edge://', 'extension://',
+  'devtools://', 'about:', 'data:', 'view-source:',
+]
+
+function isDebugable(url) {
+  if (!url) return false
+  return !UNDEBUGABLE_SCHEMES.some(scheme => url.startsWith(scheme))
+}
+
+// Race a promise against a timeout — prevents a single tab from hanging the whole batch
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+  ])
+}
+
 async function attachDebuggerToTab(tabId) {
   if (capturedTabs.has(tabId)) return
   try {
     const tab = await chrome.tabs.get(tabId)
-    // Skip internal browser pages — can't debug those
-    if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('edge://')) return
-    await chrome.debugger.attach({ tabId }, '1.3')
-    await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
+    if (!isDebugable(tab.url)) return
+    await withTimeout(chrome.debugger.attach({ tabId }, '1.3'), 5000)
+    await withTimeout(chrome.debugger.sendCommand({ tabId }, 'Network.enable', {}), 5000)
     // Auto-attach to popups/new windows opened from this tab
     try {
-      await chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', {
+      await withTimeout(chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', {
         autoAttach: true,
-        waitForDebuggerOnStart: true,  // pause new targets so we don't miss requests
+        waitForDebuggerOnStart: false,
         flatten: true,
-      })
+      }), 5000)
     } catch { /* Target.setAutoAttach may not be supported in all browsers */ }
     capturedTabs.add(tabId)
   } catch (e) {
-    // Already attached or not debuggable — ignore
+    // Already attached, not debuggable, or timed out — skip
   }
 }
 
