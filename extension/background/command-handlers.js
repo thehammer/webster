@@ -79,11 +79,15 @@ async function attachDebuggerToTab(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId)
     if (!isDebugable(tab.url)) return
-    await withTimeout(chrome.debugger.attach({ tabId }, '1.3'), 3000)
+    try {
+      await withTimeout(chrome.debugger.attach({ tabId }, '1.3'), 3000)
+    } catch {
+      // May already be attached from a previous session — continue to Network.enable
+    }
     await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
     capturedTabs.add(tabId)
-  } catch (e) {
-    // Already attached, not debuggable, or timed out — skip
+  } catch {
+    // Tab not debuggable, Network.enable failed, or timed out — skip
   }
 }
 
