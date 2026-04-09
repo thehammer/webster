@@ -133,11 +133,18 @@ with open('$OUT/manifest.json', 'w') as f:
       's/PRODUCT_BUNDLE_IDENTIFIER = com\.hammer\.Webster;/PRODUCT_BUNDLE_IDENTIFIER = com.hammer.webster;/g' \
       "$XCODE_OUT/Webster/Webster.xcodeproj/project.pbxproj"
 
-    # Apply patches: menu bar app (no Dock icon, no window)
+    # Apply patches: full menu bar app + bun server management
     local PATCHES="$SCRIPT_DIR/safari-patches"
-    cp "$PATCHES/AppDelegate.swift" "$XCODE_OUT/Webster/Webster/AppDelegate.swift"
-    cp "$PATCHES/Info.plist"        "$XCODE_OUT/Webster/Webster/Info.plist"
-    echo "  Patched: menu bar app (LSUIElement + AppDelegate)"
+    cp "$PATCHES/AppDelegate.swift"         "$XCODE_OUT/Webster/Webster/AppDelegate.swift"
+    cp "$PATCHES/StatusBarController.swift" "$XCODE_OUT/Webster/Webster/StatusBarController.swift"
+    cp "$PATCHES/WebsterClient.swift"       "$XCODE_OUT/Webster/Webster/WebsterClient.swift"
+    cp "$PATCHES/HotkeyManager.swift"       "$XCODE_OUT/Webster/Webster/HotkeyManager.swift"
+    cp "$PATCHES/Info.plist"                "$XCODE_OUT/Webster/Webster/Info.plist"
+    cp "$ROOT/menubar/Resources/icon-template.png" "$XCODE_OUT/Webster/Webster/icon-template.png"
+
+    # Wire new files into the Xcode project + Carbon framework + disable sandbox
+    python3 "$PATCHES/patch-pbxproj.py" "$XCODE_OUT/Webster/Webster.xcodeproj/project.pbxproj"
+    echo "  Patched: menu bar app + bun server management (StatusBarController, WebsterClient, HotkeyManager)"
 
     if [ "$RUN" = false ]; then
       echo "  Opening Xcode project..."

@@ -4,7 +4,7 @@ Goal: functional parity with (and superiority over) Anthropic's Claude-in-Chrome
 
 Marketplace/distribution improvements are explicitly out of scope for now.
 
-> **Status:** All phases complete. ✅ (42 tools, persistent HTTP MCP server)
+> **Status:** All phases complete. ✅ (40 tools, persistent HTTP MCP server, consolidated Webster.app)
 
 ---
 
@@ -349,6 +349,48 @@ After:  Claude Code → HTTP POST /mcp → persistent server (launchd) → WebSo
 | 11-B | `/mcp` HTTP route in server | `src/server.ts` | ✅ |
 | 11-C | Simplified index.ts | `src/index.ts` | ✅ |
 | 11-D | HTTP MCP session tests | `src/__tests__/mcp.test.ts` | ✅ |
+
+---
+
+---
+
+## Phase 12 — Consolidated Webster.app ✅
+
+**What:** Merge the standalone menu bar app (WebsterMenu) into the Safari extension host (Webster.app) so there is only one thing to run. Webster.app now does three jobs: hosts the Safari extension, spawns and manages the bun MCP server as a subprocess, and provides the full menu bar UI.
+
+**Motivation:** Previously three separate processes needed to be running (bun server via launchd, Webster.app Safari host, WebsterMenu menu bar app). Consolidation reduces this to one app and one launchd entry.
+
+**Architecture after Phase 12:**
+```
+launchd → Webster.app
+              ├── spawns bun server (src/index.ts) as child Process
+              ├── hosts Safari Web Extension
+              └── menu bar UI (StatusBarController, WebsterClient, HotkeyManager)
+```
+
+**Files changed:**
+- `scripts/safari-patches/AppDelegate.swift` — replaces minimal AppDelegate with one that spawns bun via `Process()` and creates `StatusBarController`
+- `scripts/safari-patches/StatusBarController.swift` — full menu bar UI (copied from `menubar/`)
+- `scripts/safari-patches/WebsterClient.swift` — HTTP client for `/api/*` (copied from `menubar/`)
+- `scripts/safari-patches/HotkeyManager.swift` — global hotkey ⌃⌥R (copied from `menubar/`)
+- `scripts/safari-patches/patch-pbxproj.py` (new) — wires new Swift files into generated Xcode project, adds Carbon framework, disables app sandbox so bun can be spawned, removes `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` (incompatible with Carbon C callbacks)
+- `scripts/build-extension.sh` — patch section updated to copy new files and run `patch-pbxproj.py`
+- `~/Library/LaunchAgents/com.hammer.webster.plist` — consolidated to one entry pointing at `Webster.app/Contents/MacOS/Webster` with `WEBSTER_BUN_PATH` and `WEBSTER_PROJECT_DIR` env vars
+
+**Key env vars read by Webster.app at launch:**
+- `WEBSTER_BUN_PATH` — explicit path to bun binary (falls back to scanning common locations)
+- `WEBSTER_PROJECT_DIR` — path to the webster repo (required for `bun run src/index.ts`)
+- `WEBSTER_PORT` — server port (default 3456)
+
+**Platform note:** On Linux/Windows there is no Safari extension requirement. The equivalent setup is a systemd/Task Scheduler service running `bun start` directly, plus an optional Electron/Tauri tray app for the UI.
+
+| Sub-task | Status |
+|---|---|
+| AppDelegate spawns bun subprocess | ✅ |
+| StatusBarController + WebsterClient + HotkeyManager patches | ✅ |
+| patch-pbxproj.py (idempotent, deterministic UUIDs) | ✅ |
+| build-extension.sh updated | ✅ |
+| launchd consolidated to one plist | ✅ |
 
 ---
 

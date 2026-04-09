@@ -41,7 +41,7 @@ Comparison of Webster (open source, multi-browser MCP server) against Anthropic'
 | **Concurrent session support** | ✅ HTTP MCP, shared persistent server, `claim_tab`/`release_tab` | ❌ Single session |
 | **Server architecture** | ✅ Persistent launchd service, HTTP MCP transport | ❌ Subprocess per session |
 | **Server registry** | ✅ `~/.webster/registry.json` | ❌ |
-| **Total tools** | 42 | ~18 |
+| **Total tools** | 40 | ~18 |
 
 ---
 

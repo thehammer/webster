@@ -6,11 +6,12 @@ Supports **Chrome, Firefox, and Safari** simultaneously. Switch between browsers
 
 ## How it works
 
-Webster has three parts:
+Webster has two parts:
 
 1. **MCP server** — a persistent local server that Claude Code connects to over HTTP
 2. **Browser extension** — auto-connects to the server via WebSocket and executes browser commands
-3. **Menu bar app** *(optional, macOS)* — system tray icon with capture controls and global hotkey
+
+On macOS, **Webster.app** (required for the Safari extension) also manages the server and provides a menu bar UI with capture controls and a global hotkey — so there's only one thing to run.
 
 ```
 Claude Code Session A ──┐
@@ -18,7 +19,7 @@ Claude Code Session B ──┤── HTTP /mcp ──→ Webster Server ──�
 Claude Code Session C ──┘    (persistent,                     (WebSocket)
                                launchd-managed)
                                     ↑
-                              Menu Bar App ── polls /api/*
+                              Webster.app ── spawns server, polls /api/*
                               Web Dashboard ── /dashboard
                               Replay Viewer ── /replay/{id}
 ```
@@ -35,9 +36,14 @@ cd webster
 bun install
 ```
 
+**Run the server:**
+```bash
+bun start
+```
+
 **Recommended: run as a persistent background service (launchd on macOS)**
 
-Create `~/Library/LaunchAgents/com.yourname.webster.plist`:
+Create `~/Library/LaunchAgents/com.yourname.webster.plist`. If you're using Webster.app for Safari (see below), point it at the app binary — Webster.app spawns the server automatically:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -48,31 +54,36 @@ Create `~/Library/LaunchAgents/com.yourname.webster.plist`:
   <string>com.yourname.webster</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/path/to/bun</string>
-    <string>run</string>
-    <string>/path/to/webster/src/index.ts</string>
+    <string>/Users/yourname/Applications/Webster.app/Contents/MacOS/Webster</string>
   </array>
-  <key>WorkingDirectory</key>
-  <string>/path/to/webster</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key>
-    <string>/path/to/bun/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
     <string>/Users/yourname</string>
     <key>WEBSTER_PORT</key>
     <string>3456</string>
+    <key>WEBSTER_BUN_PATH</key>
+    <string>/path/to/bun</string>
+    <key>WEBSTER_PROJECT_DIR</key>
+    <string>/path/to/webster</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
-  <key>StandardOutPath</key>
-  <string>/Users/yourname/.webster/webster.log</string>
-  <key>StandardErrorPath</key>
-  <string>/Users/yourname/.webster/webster.log</string>
 </dict>
 </plist>
+```
+
+If you're not using Safari, point directly at bun instead:
+
+```xml
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/bun</string>
+    <string>run</string>
+    <string>/path/to/webster/src/index.ts</string>
+  </array>
 ```
 
 ```bash
@@ -108,29 +119,22 @@ Build for your browser(s):
 2. Enable **Developer mode**
 3. Click **Load unpacked** → select `build/extension/chrome/`
 
-**Firefox** — `build/extension/firefox/`
+**Firefox** — build as a zip (newer Firefox requires a packaged file, not a bare directory):
+```bash
+./scripts/build-extension.sh --firefox --zip
+```
 1. Open `about:debugging` → **This Firefox**
-2. Click **Load Temporary Add-on** → select any file in `build/extension/firefox/`
+2. Click **Load Temporary Add-on** → select `build/extension/webster-firefox.zip`
 
-**Safari** — builds, signs, and launches automatically:
+**Safari** — Webster.app hosts the extension, manages the bun server, and provides the menu bar UI all in one. Build, sign, and launch:
 ```bash
 ./scripts/build-extension.sh --safari --run
 ```
 Then enable Webster in Safari → Settings → Extensions.
 
+Webster.app installs to `~/Applications/Webster.app`. To start it automatically at login, set up a launchd plist pointing at `Webster.app/Contents/MacOS/Webster` (see Step 1 above).
+
 The extension auto-connects to the server on port 3456. The popup shows connection status and lets you add additional server ports for concurrent sessions.
-
-### 3. Install the menu bar app (optional, macOS)
-```bash
-./scripts/install-menubar.sh
-```
-
-This builds the Swift menu bar app, installs it to `/usr/local/bin/webster-menu`, and creates a launchd agent so it starts automatically.
-
-Or run in development:
-```bash
-cd menubar && swift build && .build/debug/WebsterMenu
-```
 
 ## Capture & Replay
 
@@ -180,7 +184,7 @@ Open `http://localhost:3456/dashboard` for a web UI with:
 ### Menu bar app
 <img width="579" height="269" alt="Screenshot 2026-04-08 at 3 59 51 PM" src="https://github.com/user-attachments/assets/deba8b0f-65f0-433b-bc03-9be98211026b" />
 
-The macOS menu bar app provides:
+On macOS, Webster.app includes a full menu bar UI:
 
 - Spider icon with live server/browser status
 - Start/stop capture from the tray
@@ -297,7 +301,7 @@ bun test                              # run tests (60 tests)
 bun run typecheck                     # type check
 bun start                             # start server manually
 ./scripts/build-extension.sh --all   # build all browser extensions
-cd menubar && swift build             # build menu bar app
+./scripts/build-extension.sh --safari --run   # build + install Webster.app (macOS)
 ```
 
 ## License
