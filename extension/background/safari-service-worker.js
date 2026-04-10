@@ -5,7 +5,7 @@
 // This file is concatenated with command-handlers.js during the Safari build.
 // Do NOT use ES module import/export syntax here.
 
-const DEFAULT_PORT = 3000
+const DEFAULT_PORT = 3456
 const KEEPALIVE_ALARM = 'webster-keepalive'
 const KEEPALIVE_INTERVAL_MINUTES = 0.4 // ~24s, well under Safari's ~30s suspend threshold
 
