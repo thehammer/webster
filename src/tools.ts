@@ -599,15 +599,40 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'get_input_log',
-      description: 'Return buffered user input events from the current page: mouse moves, clicks, and key presses. Useful for understanding what a user is doing or verifying that programmatic input registered correctly.',
+      description: 'Return buffered user input events from the current page: mouse moves, clicks, key presses, form changes, scrolls, and focus/blur transitions. Click, keyboard, change, and focus events include element context (tag, text, href, role, aria-label, testid, xpath). Elements inside shadow DOM also include a shadowHost descriptor. Change events include the final field value (password fields masked as "***"). Events from same-origin and cross-origin iframes are included, tagged with a frame field ({url, origin}). Supports server-side filtering via types (array of event types like ["click","change"]) and minTimestamp (only events with t > this ms). Use waitFor:"new_events" to long-poll — the call blocks until matching events arrive or waitTimeoutMs (default 5000ms) elapses. Long-polling with clear:false and minTimestamp is the recommended pattern for real-time observation without data loss.',
       inputSchema: {
         type: 'object',
         properties: {
-          clear: { type: 'boolean', description: 'Clear the buffer after reading (default true)' },
+          clear: { type: 'boolean', description: 'Clear the buffer after reading (default true). When types or minTimestamp filters are set, only the matched events are cleared.' },
+          types: { type: 'array', items: { type: 'string' }, description: 'Filter to specific event types, e.g. ["click","change","focusin"]. Mousemove and keydown noise are excluded when not listed.' },
+          minTimestamp: { type: 'number', description: 'Only return events with t > this value (ms since epoch). Use the last event\'s t to page forward without duplicates.' },
+          waitFor: { type: 'string', enum: ['new_events'], description: 'Block until matching events arrive. Use "new_events" to long-poll.' },
+          waitTimeoutMs: { type: 'number', description: 'Max ms to wait when waitFor is set (default 5000).' },
           tabId: { type: 'number', description: 'Tab ID (defaults to active tab)' },
         },
       },
-      execute: (input) => dispatch('getInputLog', input),
+      execute: async (input) => {
+        const waitFor = input.waitFor as string | undefined
+        const waitTimeoutMs = (input.waitTimeoutMs as number) ?? 5000
+
+        const poll = () => dispatch('getInputLog', input)
+
+        if (waitFor !== 'new_events') {
+          return poll()
+        }
+
+        // Long-poll: retry every 100ms until events arrive or timeout elapses.
+        // Filtering (types, minTimestamp) is applied server-side in page-script.js
+        // so each poll only returns genuinely new matching events.
+        const start = Date.now()
+        while (Date.now() - start < waitTimeoutMs) {
+          const result = await poll() as Record<string, unknown>
+          const data = result?.data
+          if (Array.isArray(data) && data.length > 0) return result
+          await new Promise<void>(r => setTimeout(r, 100))
+        }
+        return { success: true, data: [] }
+      },
     },
 
     {

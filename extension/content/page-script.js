@@ -217,8 +217,34 @@
   const MAX_INPUT = 200
   let lastMouseMoveTime = 0
   const MOUSEMOVE_THROTTLE_MS = 100 // max 10 events/s
+  let lastScrollTime = 0
+  const SCROLL_THROTTLE_MS = 100 // max 10 events/s
+
+  // Safari anchor-click recovery: on Safari, clicking <a href="#..."> can
+  // dispatch hashchange BEFORE (or instead of) the click event. We track the
+  // last mousedown on an anchor so hashchange can emit the click if click never
+  // fires. The emitted flag prevents a duplicate if click does fire afterwards.
+  let pendingAnchorClick = null
+
+  // When running inside an iframe, relay events to the top frame rather than
+  // buffering locally. The top frame aggregates all iframe events.
+  const IS_FRAME = window !== window.top
+  const FRAME_URL = IS_FRAME ? location.href : null
+  const FRAME_ORIGIN = IS_FRAME ? location.origin : null
 
   function pushInput(entry) {
+    if (IS_FRAME) {
+      try {
+        window.top.postMessage({
+          type: 'WEBSTER_FRAME_INPUT',
+          frame: { url: FRAME_URL, origin: FRAME_ORIGIN },
+          entry,
+        }, '*')
+      } catch {
+        // Sandboxed iframe may block access to window.top — discard
+      }
+      return
+    }
     inputBuffer.push(entry)
     if (inputBuffer.length > MAX_INPUT) inputBuffer.shift()
   }
@@ -234,6 +260,56 @@
 
   const MOUSE_BUTTONS = ['left', 'middle', 'right']
 
+  // ─── Element context helpers ──────────────────────────────────────────────
+  const MAX_TEXT = 120
+  const MAX_CLASSES = 100
+
+  function describeElement(el) {
+    if (!el || el.nodeType !== 1) return null
+    const desc = { tag: el.tagName }
+    if (el.id) desc.id = el.id
+    const cls = typeof el.className === 'string' ? el.className : el.className?.baseVal
+    if (cls) desc.classes = cls.slice(0, MAX_CLASSES)
+    const text = el.innerText?.trim()
+    if (text) desc.text = text.slice(0, MAX_TEXT)
+    if (el.href) desc.href = el.href
+    if (el.getAttribute('role')) desc.role = el.getAttribute('role')
+    if (el.getAttribute('aria-label')) desc.ariaLabel = el.getAttribute('aria-label')
+    if (el.getAttribute('data-testid')) desc.testId = el.getAttribute('data-testid')
+    if (el.name) desc.name = el.name
+    if (el.placeholder) desc.placeholder = el.placeholder
+    desc.xpath = computeXPath(el)
+    // Shadow DOM: record the host element so consumers know which component owns this target
+    const root = el.getRootNode()
+    if (root instanceof ShadowRoot) {
+      desc.shadowHost = describeElement(root.host)
+    }
+    return desc
+  }
+
+  function computeXPath(el) {
+    if (el.id) return `//*[@id="${el.id}"]`
+    const parts = []
+    let current = el
+    while (current && current.nodeType === 1 && current !== document.body) {
+      let sibling = current
+      let index = 1
+      while ((sibling = sibling.previousElementSibling)) {
+        if (sibling.tagName === current.tagName) index++
+      }
+      parts.unshift(`${current.tagName.toLowerCase()}[${index}]`)
+      current = current.parentElement
+    }
+    return '/' + parts.join('/')
+  }
+
+  function safeValue(el) {
+    if (el.type === 'password') return '***'
+    const v = el.value
+    if (typeof v !== 'string') return ''
+    return v.slice(0, 500)
+  }
+
   document.addEventListener('mousemove', (e) => {
     moveCursorOverlay(e.clientX, e.clientY)
     const now = Date.now()
@@ -243,27 +319,108 @@
   }, { capture: true, passive: true })
 
   document.addEventListener('mousedown', (e) => {
-    pushInput({ type: 'mousedown', x: e.clientX, y: e.clientY, button: MOUSE_BUTTONS[e.button] ?? 'unknown', t: Date.now() })
+    const el = e.composedPath()[0] ?? e.target
+    // Track anchor mousedowns for Safari hash-nav recovery (see hashchange handler below)
+    const anchor = el.closest?.('a') ?? null
+    pendingAnchorClick = anchor
+      ? { el: anchor, x: e.clientX, y: e.clientY, t: Date.now(), emitted: false }
+      : null
+    pushInput({ type: 'mousedown', x: e.clientX, y: e.clientY, button: MOUSE_BUTTONS[e.button] ?? 'unknown', t: Date.now(), element: describeElement(el) })
   }, { capture: true, passive: true })
 
   document.addEventListener('mouseup', (e) => {
-    pushInput({ type: 'mouseup', x: e.clientX, y: e.clientY, button: MOUSE_BUTTONS[e.button] ?? 'unknown', t: Date.now() })
+    const el = e.composedPath()[0] ?? e.target
+    pushInput({ type: 'mouseup', x: e.clientX, y: e.clientY, button: MOUSE_BUTTONS[e.button] ?? 'unknown', t: Date.now(), element: describeElement(el) })
   }, { capture: true, passive: true })
 
   document.addEventListener('click', (e) => {
-    pushInput({ type: 'click', x: e.clientX, y: e.clientY, button: 'left', t: Date.now() })
+    // If hashchange already emitted this click (Safari fired hashchange first),
+    // skip it to avoid a duplicate entry, then clear the pending state.
+    if (pendingAnchorClick?.emitted) {
+      pendingAnchorClick = null
+      return
+    }
+    pendingAnchorClick = null
+    const el = e.composedPath()[0] ?? e.target
+    pushInput({ type: 'click', x: e.clientX, y: e.clientY, button: 'left', t: Date.now(), element: describeElement(el) })
   }, { capture: true, passive: true })
 
+  // Safari fix: emit the anchor click from the last mousedown when hashchange fires
+  // before (or instead of) the click event. The 1-second window covers any reasonable
+  // click-to-navigation latency; emitted flag prevents a duplicate if click also fires.
+  window.addEventListener('hashchange', () => {
+    const pending = pendingAnchorClick
+    if (pending && !pending.emitted && Date.now() - pending.t < 1000) {
+      pending.emitted = true
+      pushInput({
+        type: 'click',
+        x: pending.x,
+        y: pending.y,
+        button: 'left',
+        t: pending.t,
+        element: describeElement(pending.el),
+      })
+    }
+  }, { passive: true })
+
   document.addEventListener('keydown', (e) => {
-    pushInput({ type: 'keydown', key: e.key, modifiers: inputModifiers(e), t: Date.now() })
+    const el = e.composedPath()[0] ?? e.target
+    pushInput({ type: 'keydown', key: e.key, modifiers: inputModifiers(e), t: Date.now(), element: describeElement(el) })
   }, { capture: true, passive: true })
 
   document.addEventListener('keyup', (e) => {
-    pushInput({ type: 'keyup', key: e.key, modifiers: inputModifiers(e), t: Date.now() })
+    const el = e.composedPath()[0] ?? e.target
+    pushInput({ type: 'keyup', key: e.key, modifiers: inputModifiers(e), t: Date.now(), element: describeElement(el) })
+  }, { capture: true, passive: true })
+
+  document.addEventListener('change', (e) => {
+    const el = e.composedPath()[0] ?? e.target
+    if (el.matches('input, textarea, select')) {
+      pushInput({ type: 'change', t: Date.now(), element: describeElement(el), value: safeValue(el) })
+    }
+  }, { capture: true, passive: true })
+
+  document.addEventListener('scroll', (e) => {
+    const now = Date.now()
+    if (now - lastScrollTime < SCROLL_THROTTLE_MS) return
+    lastScrollTime = now
+    const target = e.target
+    const isDoc = target === document || target === document.documentElement || target === document.body
+    const entry = {
+      type: 'scroll',
+      x: isDoc ? window.scrollX : target.scrollLeft,
+      y: isDoc ? window.scrollY : target.scrollTop,
+      t: now,
+    }
+    if (!isDoc) entry.element = describeElement(target)
+    pushInput(entry)
+  }, { capture: true, passive: true })
+
+  document.addEventListener('focusin', (e) => {
+    const el = e.composedPath()[0] ?? e.target
+    pushInput({ type: 'focusin', t: Date.now(), element: describeElement(el) })
+  }, { capture: true, passive: true })
+
+  document.addEventListener('focusout', (e) => {
+    const el = e.composedPath()[0] ?? e.target
+    pushInput({ type: 'focusout', t: Date.now(), element: describeElement(el) })
   }, { capture: true, passive: true })
 
   // ─── Message handler ──────────────────────────────────────────────────────
   window.addEventListener('message', (event) => {
+    // Relay from child iframes — must come before the same-window guard.
+    // Frames send WEBSTER_FRAME_INPUT via window.top.postMessage so event.source
+    // is the iframe window, not this window.
+    if (!IS_FRAME && event.data?.type === 'WEBSTER_FRAME_INPUT') {
+      const { frame, entry } = event.data
+      if (entry && typeof entry === 'object') {
+        entry.frame = frame
+        inputBuffer.push(entry)
+        if (inputBuffer.length > MAX_INPUT) inputBuffer.shift()
+      }
+      return
+    }
+
     if (event.source !== window) return
 
     if (event.data?.type === 'WEBSTER_READ_CONSOLE') {
@@ -280,8 +437,27 @@
 
     if (event.data?.type === 'WEBSTER_READ_INPUT') {
       const clear = event.data.clear !== false
-      const entries = [...inputBuffer]
-      if (clear) inputBuffer.length = 0
+      const types = event.data.types    // optional string[] — filter by event type
+      const minTs = event.data.minTimestamp  // optional number — only events with t > minTs
+
+      let entries = [...inputBuffer]
+      if (types) entries = entries.filter(e => types.includes(e.type))
+      if (typeof minTs === 'number') entries = entries.filter(e => e.t > minTs)
+
+      if (clear) {
+        if (!types && typeof minTs !== 'number') {
+          // No filters — clear entire buffer (backwards-compatible behaviour)
+          inputBuffer.length = 0
+        } else {
+          // Filters active — only remove the specific entries we're returning so
+          // events of other types (or earlier timestamps) remain for other callers.
+          const returnedSet = new Set(entries)
+          for (let i = inputBuffer.length - 1; i >= 0; i--) {
+            if (returnedSet.has(inputBuffer[i])) inputBuffer.splice(i, 1)
+          }
+        }
+      }
+
       // Auto-show cursor overlay on first input drain (capture is active and recording)
       if (event.data.showCursor && !cursorOverlay) {
         showCursorOverlay()

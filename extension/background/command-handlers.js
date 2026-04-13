@@ -815,7 +815,12 @@ export async function executeCommand(command) {
       case 'getInputLog': {
         const tab = await getTargetTab(command.tabId)
         if (!tab) return { success: false, error: 'No active tab' }
-        const result = await sendToContentScript(tab.id, { action: 'getInputLog', clear: command.clear !== false })
+        const result = await sendToContentScript(tab.id, {
+          action: 'getInputLog',
+          clear: command.clear !== false,
+          types: command.types,
+          minTimestamp: command.minTimestamp,
+        })
         return result
       }
 

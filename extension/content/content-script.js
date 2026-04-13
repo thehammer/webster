@@ -185,6 +185,8 @@ async function handleCommand(cmd) {
         const entries = await getInputEntries(cmd.clear !== false, {
           showCursor: cmd.showCursor,
           hideCursor: cmd.hideCursor,
+          types: cmd.types,
+          minTimestamp: cmd.minTimestamp,
         })
         return { success: true, data: entries }
       }
