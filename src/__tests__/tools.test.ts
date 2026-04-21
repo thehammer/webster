@@ -65,15 +65,19 @@ const EXPECTED_TOOL_NAMES = [
   // Phase 9 — concurrent sessions / tab ownership
   'claim_tab',
   'release_tab',
+  // Capture enhancements
+  'annotate',
+  'export_har',
+  'redact_capture',
 ]
 
 describe('createTools', () => {
-  test('all 40 tools are present by name', () => {
+  test('all expected tools are present by name', () => {
     const names = tools.map(t => t.name)
     for (const expected of EXPECTED_TOOL_NAMES) {
       expect(names).toContain(expected)
     }
-    expect(tools).toHaveLength(40)
+    expect(tools).toHaveLength(EXPECTED_TOOL_NAMES.length)
   })
 
   test('all tools have description and inputSchema', () => {

@@ -1,6 +1,11 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js'
 import type { WebsterServer } from './server.js'
 import type { VideoFormat } from './video.js'
+import type { CaptureEventKind } from './protocol.js'
+import { redactSessionDir, readSessionEvents, parseCaptureConfig, CAPTURES_DIR, type CaptureEvent } from './capture.js'
+import { writeHarToSession } from './har.js'
+import { existsSync } from 'fs'
+import { join } from 'path'
 
 interface WebsterTool extends Tool {
   execute(input: Record<string, unknown>): Promise<unknown>
@@ -175,7 +180,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'get_network_log',
-      description: 'Get buffered network requests captured by the extension (clears buffer)',
+      description: 'Get buffered network requests captured by the extension (clears buffer). Ring buffer holds the last 500 requests only and records URL/method/status/timing — no request or response bodies. For longer runs or full bodies/headers, use start_capture. WebSocket frames are NOT in this log (only the 101 upgrade); WS frames are captured via start_capture as kind:"websocket" events.',
       inputSchema: {
         type: 'object',
         properties: {},
@@ -427,26 +432,34 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'start_capture',
-      description: 'Start deep capture using Chrome Debugger Protocol. Captures FULL network request/response bodies, headers, and timing across ALL windows including popups. Capture data streams to the server in real-time — resilient to browser extension restarts. Use stop_capture to finish, get_capture to read data.',
+      description: 'Start deep capture using Chrome Debugger Protocol. Captures network requests/responses (full headers + bodies), WebSocket frames (opcode, direction, payload), console output, JS errors, user input, and optionally DOM / storage / screenshot frames. Capture data streams to the server in real time — resilient to extension restarts. Use stop_capture to finish, get_capture to read. NOTE: Safari uses webRequest (no bodies, no WS frames) — use Chrome or Edge for full fidelity.',
       inputSchema: {
         type: 'object',
         properties: {
-          urlFilter: { type: 'string', description: 'Only capture requests where URL contains this string (e.g. "extendedcare.com"). Omit to capture everything.' },
-          includeInput: { type: 'boolean', description: 'Also capture mouse and keyboard events (clicks, moves, keypresses) alongside network traffic.' },
-          recordFrames: { type: 'boolean', description: 'Also record screenshots for video/GIF export. Frames stream to server and are stored on disk.' },
+          urlFilter: { type: 'string', description: 'Only capture requests/WS/DOM/storage where URL contains this string (case-insensitive). Omit to capture everything.' },
+          includeInput: { type: 'boolean', description: 'Also capture mouse and keyboard events alongside network traffic.' },
+          recordFrames: { type: 'boolean', description: 'Record screenshot frames for video/GIF export.' },
           fps: { type: 'number', description: 'Frames per second for recording (default: 2). Only used when recordFrames is true.' },
+          maxBodyBytes: { type: 'number', description: 'Max bytes retained inline per text response body or WS frame payload. Longer bodies are truncated with a marker. Default 512000 (500 KB).' },
+          captureBinaryBodies: { type: 'boolean', description: 'When true, binary response bodies (images, PDFs, fonts, etc.) are also fetched and saved to the session bodies/ directory; events reference them by path. Default false.' },
+          recordDom: {
+            description: 'Capture DOM (documentElement.outerHTML) as kind:"dom" events. Pass true or "onNavigate" for load/attach snapshots; "periodic" for load + every 10s. Default off — DOM is large. Chrome/Edge only.',
+            anyOf: [
+              { type: 'boolean' },
+              { type: 'string', enum: ['onNavigate', 'periodic'] },
+            ],
+          },
+          recordStorage: { type: 'boolean', description: 'Snapshot cookies + localStorage + sessionStorage as kind:"storage" events on attach and on each navigation. Default off.' },
+          redact: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Regex patterns (case-insensitive, global) to replace with [REDACTED] across all text fields (URL, headers, bodies) before events hit disk. Useful for scrubbing PHI or auth tokens during capture.',
+          },
         },
       },
       execute: async (input) => {
-        const config = {
-          urlFilter: (input.urlFilter as string) || null,
-          includeInput: !!input.includeInput,
-          recordFrames: !!input.recordFrames,
-          fps: (input.fps as number) || 2,
-        }
-
         // Create server-side session BEFORE telling the extension to start
-        const session = server.startCaptureSession(config)
+        const session = server.startCaptureSession(parseCaptureConfig(input))
 
         // Tell extension to start capture + streaming
         await dispatch('startCapture', {
@@ -479,13 +492,19 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'get_capture',
-      description: 'Read capture data from the server. Returns a summary by default. Use parameters to drill into specific events or filter by URL. Data is read from the server — no round-trip to the browser extension.',
+      description: 'Read capture data from the server. Returns a summary by default. Use parameters to drill into specific events, filter by URL/kind/method, or full-text search. Data is read from disk — no round-trip to the browser extension.',
       inputSchema: {
         type: 'object',
         properties: {
           events: { type: 'boolean', description: 'Include the full event list (default: false, returns summary only)' },
-          kind: { type: 'string', enum: ['network', 'input', 'console', 'page'], description: 'Filter events by kind' },
-          urlFilter: { type: 'string', description: 'Filter network events by URL substring' },
+          kind: {
+            type: 'string',
+            enum: ['network', 'input', 'console', 'page', 'websocket', 'dom', 'storage', 'annotation', 'meta'],
+            description: 'Filter events by kind',
+          },
+          urlFilter: { type: 'string', description: 'Filter events with a url field by URL substring (case-insensitive)' },
+          method: { type: 'string', description: 'Filter network events by HTTP method (e.g. "POST"). Non-network events are unaffected.' },
+          search: { type: 'string', description: 'Case-insensitive substring match across the full stringified event (URL, headers, body, WS payload, DOM HTML…). Handy for finding a specific payload fragment in a long session.' },
           event: { type: 'number', description: 'Return a single event by index (0-based)' },
           offset: { type: 'number', description: 'Skip first N events (for pagination)' },
           limit: { type: 'number', description: 'Max events to return (for pagination)' },
@@ -505,8 +524,10 @@ export function createTools(server: WebsterServer): WebsterTool[] {
         // Full event list with optional filters
         if (input.events) {
           return session.readEvents({
-            kind: input.kind as 'network' | 'input' | undefined,
+            kind: input.kind as CaptureEventKind | undefined,
             urlFilter: input.urlFilter as string | undefined,
+            method: input.method as string | undefined,
+            search: input.search as string | undefined,
             offset: input.offset as number | undefined,
             limit: input.limit as number | undefined,
           })
@@ -514,6 +535,98 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
         // Default: summary only
         return session.getSnapshot()
+      },
+    },
+
+    {
+      name: 'annotate',
+      description: 'Write a human-readable annotation into the active capture stream. Use this to mark meaningful moments during exploration — "clicked decline", "OTP entered", "bug reproduced here". Annotations are kind:"annotation" events and make post-hoc analysis much faster (search for the bookmark, read the 10 seconds around it). Requires an active capture session.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          text: { type: 'string', description: 'Annotation text (what just happened / what to look for)' },
+          tag: { type: 'string', description: 'Optional tag for grouping (e.g. "action", "bug", "milestone")' },
+          color: { type: 'string', description: 'Optional color hint for replay viewers (any string — hex, css name, etc.)' },
+        },
+        required: ['text'],
+      },
+      execute: async (input) => {
+        const session = server.getCaptureSession()
+        if (!session?.active) throw new Error('No active capture — call start_capture first')
+        const text = input.text as string
+        if (!text) throw new Error('text is required')
+        const tag = typeof input.tag === 'string' ? input.tag : undefined
+        const color = typeof input.color === 'string' ? input.color : undefined
+        const annotation = session.appendAnnotation(text, tag, color)
+        return { sessionId: session.id, eventCount: session.getSnapshot().eventCount, annotation }
+      },
+    },
+
+    {
+      name: 'export_har',
+      description: 'Export the active (or a specified) capture session as a HAR 1.2 file, loadable into Chrome DevTools Network panel. WebSocket frames are attached via the _webSocketMessages extension field (same shape DevTools uses). Returns the written file path.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Target session ID (defaults to the current capture session)' },
+        },
+      },
+      execute: async (input) => {
+        const sessionId = input.sessionId as string | undefined
+        let dir: string
+        let events: CaptureEvent[]
+        if (sessionId) {
+          dir = join(CAPTURES_DIR, sessionId)
+          if (!existsSync(dir)) throw new Error(`Session not found: ${sessionId}`)
+          events = readSessionEvents(dir)
+        } else {
+          const session = server.getCaptureSession()
+          if (!session) throw new Error('No active capture session — pass sessionId for a past session, or start_capture first')
+          dir = session.dir
+          events = session.readEvents()
+        }
+        const path = writeHarToSession(dir, events)
+        const networkCount = events.filter(e => e.kind === 'network').length
+        const wsFrameCount = events.filter(e => e.kind === 'websocket' && e.subKind === 'frame').length
+        return { path, entries: networkCount, webSocketFrames: wsFrameCount }
+      },
+    },
+
+    {
+      name: 'redact_capture',
+      description: 'Apply redaction patterns to an existing capture on disk. Rewrites events.jsonl in place, replacing every regex match (case-insensitive, global) with [REDACTED]. Targets URL, headers, bodies, payloads, and DOM HTML — anywhere text appears. Use this AFTER the fact when you forgot to pass redact: to start_capture, or when sharing a session externally.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sessionId: { type: 'string', description: 'Session ID to redact (defaults to the current capture session)' },
+          patterns: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Regex patterns to replace with [REDACTED] (applied globally, case-insensitively)',
+          },
+        },
+        required: ['patterns'],
+      },
+      execute: async (input) => {
+        const patterns = input.patterns as string[]
+        if (!Array.isArray(patterns) || patterns.length === 0) {
+          throw new Error('patterns must be a non-empty array of regex strings')
+        }
+        const sessionId = input.sessionId as string | undefined
+        let dir: string
+        let resolvedId: string
+        if (sessionId) {
+          resolvedId = sessionId
+          dir = join(CAPTURES_DIR, sessionId)
+          if (!existsSync(dir)) throw new Error(`Session not found: ${sessionId}`)
+        } else {
+          const session = server.getCaptureSession()
+          if (!session) throw new Error('No capture session — pass sessionId for a past session')
+          resolvedId = session.id
+          dir = session.dir
+        }
+        const result = redactSessionDir(dir, patterns)
+        return { sessionId: resolvedId, ...result }
       },
     },
 

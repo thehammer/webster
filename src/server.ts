@@ -1,8 +1,11 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
-import { isResult, isCaptureEvent, isCaptureDone, type WsCommand, type WsMessage } from './protocol.js'
-import { CaptureSession, cleanOldSessions, CAPTURES_DIR, type CaptureConfig, type CaptureEvent } from './capture.js'
+import {
+  isResult, isCaptureEvent, isCaptureDone, isCaptureBody, isCapturePush,
+  type WsCommand, type WsMessage, type WsCaptureEvent, type WsCaptureDone, type WsCaptureBody,
+} from './protocol.js'
+import { CaptureSession, cleanOldSessions, CAPTURES_DIR, parseCaptureConfig, type CaptureConfig, type CaptureEvent } from './capture.js'
 import { handleReplayRequest } from './replay.js'
 import { buildDashboardHtml } from './dashboard.js'
 import { FAVICON_SVG } from './favicon.js'
@@ -236,13 +239,7 @@ export class WebsterServer {
     if (req.method === 'POST' && url.pathname === '/api/capture/start') {
       let body: Record<string, unknown> = {}
       try { body = await req.json() as Record<string, unknown> } catch { /* empty config */ }
-      const config: CaptureConfig = {
-        urlFilter: (body.urlFilter as string) || null,
-        includeInput: !!body.includeInput,
-        recordFrames: !!body.recordFrames,
-        fps: (body.fps as number) || 2,
-      }
-      const session = this.startCaptureSession(config)
+      const session = this.startCaptureSession(parseCaptureConfig(body))
       try {
         await this.dispatch({
           action: 'startCapture',
@@ -253,6 +250,19 @@ export class WebsterServer {
         return Response.json({ error: String(e) }, { status: 500 })
       }
       return Response.json(session.getSnapshot())
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/capture/annotate') {
+      const session = this.captureSession
+      if (!session?.active) return Response.json({ error: 'No active capture' }, { status: 400 })
+      let body: Record<string, unknown> = {}
+      try { body = await req.json() as Record<string, unknown> } catch { /* empty body ok */ }
+      const text = typeof body.text === 'string' ? body.text : ''
+      if (!text) return Response.json({ error: 'text is required' }, { status: 400 })
+      const tag = typeof body.tag === 'string' ? body.tag : undefined
+      const color = typeof body.color === 'string' ? body.color : undefined
+      session.appendAnnotation(text, tag, color)
+      return Response.json({ success: true, sessionId: session.id, eventCount: session.getSnapshot().eventCount })
     }
 
     if (req.method === 'POST' && url.pathname === '/api/capture/stop') {
@@ -305,7 +315,7 @@ export class WebsterServer {
 
   private handleHttpResult(msg: WsMessage) {
     // Capture push events via HTTP (Safari path)
-    if (isCaptureEvent(msg) || isCaptureDone(msg)) {
+    if (isCapturePush(msg)) {
       this.handleCaptureEvent(msg)
       return
     }
@@ -356,7 +366,7 @@ export class WebsterServer {
     }
 
     // Capture push events — extension streaming data to server
-    if (isCaptureEvent(msg) || isCaptureDone(msg)) {
+    if (isCapturePush(msg)) {
       this.handleCaptureEvent(msg)
       return
     }
@@ -554,7 +564,7 @@ export class WebsterServer {
     return session
   }
 
-  private handleCaptureEvent(msg: WsMessage): void {
+  private handleCaptureEvent(msg: WsCaptureEvent | WsCaptureDone | WsCaptureBody): void {
     if (!this.captureSession?.active) return
 
     if (isCaptureEvent(msg)) {
@@ -566,13 +576,21 @@ export class WebsterServer {
           this.captureSession.appendFrame(buffer)
         }
       } else {
-        // Network or input event — append as-is
+        // Network, input, websocket, dom, storage, annotation, console, page, meta — append as-is
         const event: CaptureEvent = {
           kind: msg.kind,
           timestamp: (msg.data.timestamp as number) || Date.now(),
           ...msg.data,
         }
         this.captureSession.appendEvent(event)
+      }
+    } else if (isCaptureBody(msg)) {
+      // Binary response body — write to bodies/ and rewrite the matching
+      // network event so the large payload is referenced, not inlined.
+      const buffer = Buffer.from(msg.data ?? '', 'base64')
+      const ref = this.captureSession.appendBody(msg.requestId, buffer, msg.mimeType)
+      if (ref) {
+        this.captureSession.attachBodyReference(msg.requestId, ref, msg.mimeType)
       }
     } else if (isCaptureDone(msg)) {
       this.captureSession.finalize()

@@ -25,7 +25,24 @@ let captureStartMonotonic = 0    // first CDP timestamp seen — used with captu
 let captureMonotonicCalibrated = false
 let captureRecordingFrames = false // true when recordFrames is active — tells drainInputEvents to show cursor
 let captureCursorShown = false     // true once we've sent showCursor to content scripts
-const MAX_CAPTURE_BODY = 512000  // 500KB max per response body
+
+// Body capture config — overridable per start_capture call.
+const DEFAULT_MAX_CAPTURE_BODY = 512000  // 500KB max per text response body
+let captureMaxBodyBytes = DEFAULT_MAX_CAPTURE_BODY
+let captureBinaryBodies = false          // when true, binary bodies stream to server as capture_body messages
+
+// DOM snapshot state
+let captureDomMode = null    // null | 'onNavigate' | 'periodic'
+let captureDomInterval = null
+const DOM_PERIODIC_MS = 10000
+
+// Storage snapshot state
+let captureStorageEnabled = false
+
+// WS frame payload cap — mirrors captureMaxBodyBytes semantics. The same value
+// is used so consumers don't have to reason about two limits.
+const WS_FRAME_MAX_PAYLOAD = () => captureMaxBodyBytes
+
 const INPUT_DRAIN_INTERVAL_MS = 2000
 
 function matchesCaptureFilter(url) {
@@ -74,20 +91,60 @@ function withTimeout(promise, ms) {
   ])
 }
 
+function emitCaptureMeta(code, message, extra = {}) {
+  if (!captureActive) return
+  try {
+    pushToServer({
+      type: 'capture_event',
+      kind: 'meta',
+      data: {
+        subKind: 'warning',
+        code,
+        message,
+        timestamp: Date.now(),
+        ...extra,
+      },
+    })
+  } catch { /* server may be gone — best effort */ }
+}
+
 async function attachDebuggerToTab(tabId) {
   if (capturedTabs.has(tabId)) return
+  let tabUrl = null
   try {
     const tab = await chrome.tabs.get(tabId)
+    tabUrl = tab.url
     if (!isDebugable(tab.url)) return
-    try {
-      await withTimeout(chrome.debugger.attach({ tabId }, '1.3'), 3000)
-    } catch {
-      // May already be attached from a previous session — continue to Network.enable
-    }
+  } catch {
+    return // tab gone
+  }
+
+  let attachFailed = false
+  try {
+    await withTimeout(chrome.debugger.attach({ tabId }, '1.3'), 3000)
+  } catch {
+    // Could be "already attached" (benign — DevTools open) or a timeout (not benign).
+    // Network.enable below will tell us which case we're in.
+    attachFailed = true
+  }
+
+  try {
     await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
     capturedTabs.add(tabId)
-  } catch {
-    // Tab not debuggable, Network.enable failed, or timed out — skip
+    if (captureDomMode === 'onNavigate' || captureDomMode === 'periodic') {
+      captureDomSnapshot(tabId, 'attach')
+    }
+    if (captureStorageEnabled) {
+      captureStorageSnapshot(tabId, 'attach')
+    }
+  } catch (err) {
+    if (attachFailed) {
+      // Both attach and Network.enable failed — CDP is genuinely unavailable for
+      // this tab. Downstream analysis will be header-only at best.
+      emitCaptureMeta('cdp_unavailable',
+        `CDP unavailable for tab ${tabId} (${tabUrl}) — request/response bodies will not be captured. Reason: ${err?.message || err}`,
+        { tabId, url: tabUrl })
+    }
   }
 }
 
@@ -190,21 +247,43 @@ function handleDebuggerEvent(source, method, params) {
     entry.endTime = cdpTimestampToIso(timestamp)
     entry.duration = Math.round((timestamp - entry._startTimestamp) * 1000)
 
-    // Fetch response body — only for text-based content
     const mime = (entry.mimeType || '').toLowerCase()
     const isText = mime.includes('json') || mime.includes('html') || mime.includes('xml') ||
                    mime.includes('text') || mime.includes('javascript') || mime.includes('css') ||
                    mime.includes('form') || mime.includes('svg')
+    const wantBody = isText || captureBinaryBodies
 
-    if (isText && tabId) {
+    if (wantBody && tabId) {
       chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId: params.requestId })
         .then((result) => {
-          if (result?.body) {
-            entry.responseBody = result.body.length > MAX_CAPTURE_BODY
-              ? result.body.slice(0, MAX_CAPTURE_BODY) + `...[truncated, ${result.body.length} total]`
-              : result.body
+          if (!result?.body) {
+            finalizeEntry(key, entry)
+            return
           }
-          if (result?.base64Encoded) entry.responseBodyEncoding = 'base64'
+          if (result.base64Encoded && captureBinaryBodies && !isText) {
+            // Binary — stream body separately. The server persists it under
+            // bodies/ and rewrites the network event with a path reference.
+            const reqId = entry._requestId
+            entry.responseBody = null
+            entry.responseBodyEncoding = 'base64'
+            // Base64 length * 3/4 approximates the decoded byte size.
+            entry.responseBodySize = Math.floor(result.body.length * 0.75)
+            finalizeEntry(key, entry)
+            pushToServer({
+              type: 'capture_body',
+              requestId: reqId,
+              tabId,
+              mimeType: mime,
+              encoding: 'base64',
+              data: result.body,
+            })
+            return
+          }
+          // Text body (or base64-encoded text) — inline with truncation.
+          entry.responseBody = result.body.length > captureMaxBodyBytes
+            ? result.body.slice(0, captureMaxBodyBytes) + `...[truncated, ${result.body.length} total]`
+            : result.body
+          if (result.base64Encoded) entry.responseBodyEncoding = 'base64'
           finalizeEntry(key, entry)
         })
         .catch(() => {
@@ -212,7 +291,7 @@ function handleDebuggerEvent(source, method, params) {
           finalizeEntry(key, entry)
         })
     } else {
-      // Binary content — record metadata only, skip body
+      // Binary content and captureBinaryBodies is false — record metadata only
       entry.responseBody = `[binary: ${mime}, not captured]`
       finalizeEntry(key, entry)
     }
@@ -227,19 +306,218 @@ function handleDebuggerEvent(source, method, params) {
     entry.duration = Math.round((timestamp - entry._startTimestamp) * 1000)
     finalizeEntry(key, entry)
   }
+
+  // ─── WebSocket frames ───────────────────────────────────────────────────────
+  // CDP fires a full lifecycle: Created → WillSendHandshake → HandshakeResponse
+  // → FrameSent / FrameReceived (repeatable) → Closed. We stream each as a
+  // kind:'websocket' capture event so downstream consumers can reconstruct the
+  // conversation.
+
+  if (method === 'Network.webSocketCreated') {
+    if (!matchesCaptureFilter(params.url || '')) return
+    pushToServer({
+      type: 'capture_event',
+      kind: 'websocket',
+      data: {
+        subKind: 'open',
+        tabId,
+        requestId: params.requestId,
+        url: params.url,
+        timestamp: Date.now(),
+      },
+    })
+    return
+  }
+
+  if (method === 'Network.webSocketFrameSent' || method === 'Network.webSocketFrameReceived') {
+    const direction = method === 'Network.webSocketFrameSent' ? 'send' : 'receive'
+    const response = params.response || {}
+    const opcode = response.opcode
+    const rawPayload = typeof response.payloadData === 'string' ? response.payloadData : ''
+    const mask = response.mask === true ? true : undefined
+    const limit = WS_FRAME_MAX_PAYLOAD()
+    const truncated = rawPayload.length > limit
+    const payload = truncated ? rawPayload.slice(0, limit) + `...[truncated, ${rawPayload.length} total]` : rawPayload
+
+    pushToServer({
+      type: 'capture_event',
+      kind: 'websocket',
+      data: {
+        subKind: 'frame',
+        tabId,
+        requestId: params.requestId,
+        direction,
+        opcode,
+        mask,
+        // CDP encodes binary frames (opcode 2) as base64 in payloadData
+        payloadEncoding: opcode === 2 ? 'base64' : 'utf8',
+        payload,
+        payloadTruncated: truncated || undefined,
+        timestamp: cdpTimestampToEpochMs(timestamp),
+      },
+    })
+    return
+  }
+
+  if (method === 'Network.webSocketFrameError') {
+    pushToServer({
+      type: 'capture_event',
+      kind: 'websocket',
+      data: {
+        subKind: 'error',
+        tabId,
+        requestId: params.requestId,
+        errorMessage: params.errorMessage || '',
+        timestamp: cdpTimestampToEpochMs(timestamp),
+      },
+    })
+    return
+  }
+
+  if (method === 'Network.webSocketClosed') {
+    pushToServer({
+      type: 'capture_event',
+      kind: 'websocket',
+      data: {
+        subKind: 'close',
+        tabId,
+        requestId: params.requestId,
+        timestamp: cdpTimestampToEpochMs(timestamp),
+      },
+    })
+    return
+  }
 }
 
 function finalizeEntry(key, entry) {
   capturePending.delete(key)
   // Convert _startTimestamp (CDP monotonic) to wall-clock epoch ms
   const timestamp = cdpTimestampToEpochMs(entry._startTimestamp)
+  const requestId = entry._requestId
   delete entry._startTimestamp
   delete entry._requestId
+  // Preserve the CDP requestId as a public field so binary-body messages and
+  // post-hoc filtering can correlate entries across streams.
+  entry.requestId = requestId
   entry.kind = 'network'
   entry.timestamp = timestamp
 
   // Stream to server immediately — no local buffering
   pushToServer({ type: 'capture_event', kind: 'network', data: entry })
+}
+
+// ─── DOM + storage snapshots ───────────────────────────────────────────────
+
+async function captureDomSnapshot(tabId, trigger) {
+  if (!captureActive) return
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        url: location.href,
+        title: document.title,
+        html: document.documentElement.outerHTML,
+      }),
+    })
+    const payload = results?.[0]?.result
+    if (!payload?.html) return
+    if (captureUrlFilter && !payload.url.toLowerCase().includes(captureUrlFilter.toLowerCase())) return
+    pushToServer({
+      type: 'capture_event',
+      kind: 'dom',
+      data: {
+        tabId,
+        url: payload.url || '',
+        title: payload.title || '',
+        html: payload.html,
+        trigger,
+        timestamp: Date.now(),
+      },
+    })
+  } catch { /* tab closed / no permission / service worker page — skip */ }
+}
+
+async function captureStorageSnapshot(tabId, trigger) {
+  if (!captureActive) return
+  try {
+    const tab = await chrome.tabs.get(tabId)
+    const url = tab?.url || ''
+    if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) return
+    if (captureUrlFilter && !url.toLowerCase().includes(captureUrlFilter.toLowerCase())) return
+
+    const cookiePromise = chrome.cookies?.getAll({ url }).catch(() => [])
+    const storagePromise = chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const readStorage = (store) => {
+          const out = {}
+          try {
+            for (let i = 0; i < store.length; i++) {
+              const k = store.key(i)
+              if (k != null) out[k] = store.getItem(k) ?? ''
+            }
+          } catch { /* storage access may throw on opaque origins */ }
+          return out
+        }
+        return {
+          local: readStorage(window.localStorage),
+          session: readStorage(window.sessionStorage),
+        }
+      },
+    }).then(r => r?.[0]?.result ?? { local: {}, session: {} }).catch(() => ({ local: {}, session: {} }))
+
+    const [cookies, storage] = await Promise.all([cookiePromise, storagePromise])
+
+    pushToServer({
+      type: 'capture_event',
+      kind: 'storage',
+      data: {
+        tabId,
+        url,
+        trigger,
+        cookies: (cookies || []).map(c => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path,
+          secure: c.secure,
+          httpOnly: c.httpOnly,
+          sameSite: c.sameSite,
+          expirationDate: c.expirationDate,
+        })),
+        localStorage: storage.local,
+        sessionStorage: storage.session,
+        timestamp: Date.now(),
+      },
+    })
+  } catch { /* best-effort snapshot */ }
+}
+
+function onCaptureNavigationCompleted(details) {
+  if (!captureActive || details.frameId !== 0) return
+  if (!capturedTabs.has(details.tabId)) return
+  if (captureDomMode === 'onNavigate' || captureDomMode === 'periodic') {
+    captureDomSnapshot(details.tabId, 'navigate')
+  }
+  if (captureStorageEnabled) {
+    captureStorageSnapshot(details.tabId, 'navigate')
+  }
+}
+
+function startDomPeriodicSnapshots() {
+  if (captureDomMode !== 'periodic') return
+  if (captureDomInterval) clearTimeout(captureDomInterval)
+  function loop() {
+    if (!captureActive || captureDomMode !== 'periodic') return
+    const tabs = [...capturedTabs]
+    for (const id of tabs) captureDomSnapshot(id, 'periodic')
+    captureDomInterval = setTimeout(loop, DOM_PERIODIC_MS)
+  }
+  captureDomInterval = setTimeout(loop, DOM_PERIODIC_MS)
+}
+
+function stopDomPeriodicSnapshots() {
+  if (captureDomInterval) { clearTimeout(captureDomInterval); captureDomInterval = null }
 }
 
 // Drain all capture data from all captured tabs and stream to server.
@@ -923,10 +1201,14 @@ export async function executeCommand(command) {
         if (captureActive) {
           // Stop existing capture first
           stopInputDraining()
+          stopDomPeriodicSnapshots()
           for (const tabId of capturedTabs) {
             await detachDebuggerFromTab(tabId)
           }
           chrome.tabs.onCreated.removeListener(onCaptureTabCreated)
+          if (chrome.webNavigation) {
+            chrome.webNavigation.onCompleted.removeListener(onCaptureNavigationCompleted)
+          }
         }
 
         captureActive = true
@@ -939,6 +1221,22 @@ export async function executeCommand(command) {
         captureStartWallMs = 0
         captureStartMonotonic = 0
 
+        // Body capture config
+        captureMaxBodyBytes = typeof command.maxBodyBytes === 'number' && command.maxBodyBytes > 0
+          ? command.maxBodyBytes
+          : DEFAULT_MAX_CAPTURE_BODY
+        captureBinaryBodies = !!command.captureBinaryBodies
+
+        // DOM snapshots: accept boolean (true → 'onNavigate') or explicit mode string
+        if (command.recordDom === true || command.recordDom === 'onNavigate') {
+          captureDomMode = 'onNavigate'
+        } else if (command.recordDom === 'periodic') {
+          captureDomMode = 'periodic'
+        } else {
+          captureDomMode = null
+        }
+        captureStorageEnabled = !!command.recordStorage
+
         // Register the debugger event handler (remove first to avoid double-registering)
         try { chrome.debugger.onEvent.removeListener(handleDebuggerEvent) } catch { /* ignore */ }
         chrome.debugger.onEvent.addListener(handleDebuggerEvent)
@@ -949,6 +1247,10 @@ export async function executeCommand(command) {
         if (chrome.webNavigation) {
           chrome.webNavigation.onBeforeNavigate.removeListener(onCaptureNavigation)
           chrome.webNavigation.onBeforeNavigate.addListener(onCaptureNavigation)
+          chrome.webNavigation.onCompleted.removeListener(onCaptureNavigationCompleted)
+          if (captureDomMode || captureStorageEnabled) {
+            chrome.webNavigation.onCompleted.addListener(onCaptureNavigationCompleted)
+          }
         }
 
         // Attach debugger + inject input scripts in one parallel pass per tab.
@@ -977,6 +1279,10 @@ export async function executeCommand(command) {
 
         if (wantInput) {
           startInputDraining()
+        }
+
+        if (captureDomMode === 'periodic') {
+          startDomPeriodicSnapshots()
         }
 
         // Start frame recording if requested — stream frames to server immediately.
@@ -1014,17 +1320,35 @@ export async function executeCommand(command) {
           }
         }
 
-        return { success: true, data: { tabsAttached: capturedTabs.size, urlFilter: captureUrlFilter, includeInput: !!command.includeInput, recordFrames: !!command.recordFrames } }
+        return {
+          success: true,
+          data: {
+            tabsAttached: capturedTabs.size,
+            urlFilter: captureUrlFilter,
+            includeInput: !!command.includeInput,
+            recordFrames: !!command.recordFrames,
+            maxBodyBytes: captureMaxBodyBytes,
+            captureBinaryBodies,
+            recordDom: captureDomMode,
+            recordStorage: captureStorageEnabled,
+          },
+        }
       }
 
       case 'stopCapture': {
         // Lightweight stop — all data already streamed to server.
         // No more zero-await constraint since we don't return data.
         stopInputDraining()
+        stopDomPeriodicSnapshots()
         captureActive = false
+        captureDomMode = null
+        captureStorageEnabled = false
+        captureBinaryBodies = false
+        captureMaxBodyBytes = DEFAULT_MAX_CAPTURE_BODY
         chrome.tabs.onCreated.removeListener(onCaptureTabCreated)
         if (chrome.webNavigation) {
           chrome.webNavigation.onBeforeNavigate.removeListener(onCaptureNavigation)
+          chrome.webNavigation.onCompleted.removeListener(onCaptureNavigationCompleted)
         }
 
         // Stop frame recording and hide cursor overlay
@@ -1044,9 +1368,10 @@ export async function executeCommand(command) {
         }
 
         // Flush remaining pending entries (incomplete requests) to server
-        for (const [key, entry] of capturePending) {
+        for (const [, entry] of capturePending) {
           entry.kind = 'network'
           entry.timestamp = cdpTimestampToEpochMs(entry._startTimestamp)
+          entry.requestId = entry._requestId
           delete entry._startTimestamp
           delete entry._requestId
           entry.responseBody = entry.responseBody || '[incomplete — capture stopped]'
