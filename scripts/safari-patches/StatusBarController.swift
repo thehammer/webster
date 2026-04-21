@@ -35,6 +35,7 @@ final class StatusBarController: NSObject {
         buildMenu()
         startPolling()
         setupHotkey()
+        observeWake()
     }
 
     // MARK: - Hotkey
@@ -71,6 +72,28 @@ final class StatusBarController: NSObject {
                 )
                 await poll()
                 showNotification(title: "Webster", body: "Capture started (⌃⌥R to stop)")
+            }
+        }
+    }
+
+    // MARK: - Wake Observer
+
+    private func observeWake() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                // macOS can drop status items after sleep — recreate
+                self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+                if let button = self.statusItem.button {
+                    button.image = Self.makeIcon(recording: self.serverStatus?.capture.active ?? false)
+                    button.image?.isTemplate = true
+                }
+                self.buildMenu()
+                await self.poll()
             }
         }
     }
