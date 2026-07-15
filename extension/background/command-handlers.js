@@ -210,6 +210,23 @@ function handleDebuggerEvent(source, method, params) {
       delete prev._startTimestamp
       delete prev._requestId
       pushToServer({ type: 'capture_event', kind: 'network', data: prev })
+    } else if (capturePending.has(key)) {
+      // requestId collision: this tabId:requestId key already holds an
+      // unfinalized entry from an earlier, unrelated request (CDP requestIds
+      // are small per-target counters that get reused, most commonly right
+      // after a top-level navigation). This is NOT a redirect continuation —
+      // that case is handled above. Without this guard, the orphaned entry
+      // below would be silently overwritten by .set() and lost entirely
+      // (worse than the stop_capture flush case, which at least marks
+      // still-pending entries "incomplete" — a request whose id gets reused
+      // mid-capture never reaches that flush and just vanishes with no
+      // trace). Most commonly this is a full-page form POST whose redirect
+      // response is delivered as a brand-new request rather than chained via
+      // `redirectResponse` on the same id — e.g. a login form POST that
+      // redirects to a GET.
+      const orphan = capturePending.get(key)
+      orphan.responseBody = orphan.responseBody || '[incomplete — requestId reused before response]'
+      finalizeEntry(key, orphan)
     }
 
     capturePending.set(key, {
