@@ -1,6 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { existsSync, readFileSync, readdirSync } from 'fs'
+import { existsSync, readFileSync, readdirSync, mkdirSync } from 'fs'
+import { join } from 'path'
 import { CaptureSession, cleanOldSessions, redactSessionDir, type CaptureEvent } from '../capture.js'
+import { writeHarToSession } from '../har.js'
 
 let session: CaptureSession
 
@@ -582,5 +584,142 @@ describe('redactSessionDir', () => {
 
   test('does not throw when session dir does not exist', () => {
     expect(() => redactSessionDir('/tmp/nonexistent-webster-session-xyz', ['foo'])).not.toThrow()
+  })
+
+  // ─── Coverage-honesty extension ──────────────────────────────────────────
+
+  test('redacts text bodies in place, leaving matches gone', () => {
+    const ref = s.appendBody('req-json', Buffer.from(JSON.stringify({ ssn: 'secret-9999', ok: true })), 'application/json')!
+    expect(ref.path).toMatch(/\.json$/)
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+    expect(res.bodiesRedacted).toBe(1)
+
+    const after = readFileSync(join(s.dir, ref.path), 'utf-8')
+    expect(after).not.toContain('secret-9999')
+    expect(after).toContain('[REDACTED]')
+    // Fields that didn't match stay intact
+    expect(after).toContain('ok')
+  })
+
+  test('leaves binary bodies byte-identical and reports them as skipped', () => {
+    const binaryBuf = Buffer.concat([
+      Buffer.from([0x25, 0x50, 0x44, 0x46, 0x2d]),
+      Buffer.from('secret-9999'),
+      Buffer.from([0x00, 0xff, 0xfe]),
+    ])
+    const ref = s.appendBody('req-pdf', binaryBuf, 'application/pdf')!
+    const filename = ref.path.slice('bodies/'.length)
+    expect(filename).toMatch(/\.pdf$/)
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+
+    const after = readFileSync(join(s.dir, ref.path))
+    expect(Buffer.compare(after, binaryBuf)).toBe(0)
+    expect(res.bodiesSkipped).toContain(filename)
+  })
+
+  test('regenerates session.har from redacted events when one already existed', () => {
+    s.appendEvent({
+      kind: 'network',
+      timestamp: Date.now(),
+      url: 'https://example.com/api?token=secret-9999',
+      method: 'GET',
+      status: 200,
+    })
+    writeHarToSession(s.dir, s.readEvents())
+
+    const harPath = join(s.dir, 'session.har')
+    const before = readFileSync(harPath, 'utf-8')
+    expect(before).toContain('secret-9999')
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+    expect(res.harRegenerated).toBe(true)
+
+    const after = readFileSync(harPath, 'utf-8')
+    expect(after).not.toContain('secret-9999')
+  })
+
+  test('does not create session.har when one did not already exist', () => {
+    s.appendEvent({ kind: 'console', timestamp: 1, text: 'secret-9999' })
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+    expect(res.harRegenerated).toBe(false)
+    expect(existsSync(join(s.dir, 'session.har'))).toBe(false)
+  })
+
+  test('reports frame count without touching frame files on disk', () => {
+    const frame1 = Buffer.from('fake-jpeg-bytes-1')
+    const frame2 = Buffer.from('fake-jpeg-bytes-2')
+    s.appendFrame(frame1)
+    s.appendFrame(frame2)
+
+    const res = redactSessionDir(s.dir, ['fake'])
+    expect(res.frameCount).toBe(2)
+
+    const files = readdirSync(s.framesDir).sort()
+    expect(files).toEqual(['frame_00001.jpg', 'frame_00002.jpg'])
+    expect(readFileSync(join(s.framesDir, 'frame_00001.jpg'))).toEqual(frame1)
+    expect(readFileSync(join(s.framesDir, 'frame_00002.jpg'))).toEqual(frame2)
+  })
+
+  test('complete is false when a binary body or frame is left uncovered', () => {
+    s.appendBody('req-pdf', Buffer.from('secret-9999-pdf-bytes'), 'application/pdf')
+    s.appendFrame(Buffer.from('frame-bytes'))
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+    expect(res.complete).toBe(false)
+
+    const meta = JSON.parse(readFileSync(s.metaPath, 'utf-8'))
+    expect(meta.redaction.complete).toBe(false)
+    expect(meta.redaction.bodiesSkipped.length).toBeGreaterThan(0)
+    expect(meta.redaction.frameCount).toBeGreaterThan(0)
+  })
+
+  test('complete is true when only text bodies are present and nothing is left uncovered', () => {
+    s.appendBody('req-json', Buffer.from(JSON.stringify({ ssn: 'secret-9999' })), 'application/json')
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+    expect(res.complete).toBe(true)
+
+    const meta = JSON.parse(readFileSync(s.metaPath, 'utf-8'))
+    expect(meta.redaction.complete).toBe(true)
+  })
+
+  test('a single unreadable body file does not abort redaction of the rest of the session', () => {
+    const ref = s.appendBody('req-good', Buffer.from(JSON.stringify({ ssn: 'secret-9999' })), 'application/json')!
+    // Simulate a corrupt/unreadable body entry: a directory sitting where a
+    // body file is expected, which makes a plain readFileSync throw (EISDIR).
+    mkdirSync(join(s.bodiesDir, 'bad-entry.json'))
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+
+    const after = readFileSync(join(s.dir, ref.path), 'utf-8')
+    expect(after).not.toContain('secret-9999')
+    expect(res.bodiesRedacted).toBe(1)
+    expect(res.bodiesSkipped).toContain('bad-entry.json')
+  })
+
+  test('running redaction twice in a row produces byte-identical output the second time', () => {
+    const ref = s.appendBody('req-json', Buffer.from(JSON.stringify({ ssn: 'secret-9999' })), 'application/json')!
+    s.appendEvent({
+      kind: 'network',
+      timestamp: Date.now(),
+      url: 'https://example.com/api?token=secret-9999',
+      method: 'GET',
+      status: 200,
+    })
+    writeHarToSession(s.dir, s.readEvents())
+
+    redactSessionDir(s.dir, ['secret-9999'])
+    const bodyAfterFirst = readFileSync(join(s.dir, ref.path), 'utf-8')
+    const harAfterFirst = readFileSync(join(s.dir, 'session.har'), 'utf-8')
+
+    redactSessionDir(s.dir, ['secret-9999'])
+    const bodyAfterSecond = readFileSync(join(s.dir, ref.path), 'utf-8')
+    const harAfterSecond = readFileSync(join(s.dir, 'session.har'), 'utf-8')
+
+    expect(bodyAfterSecond).toBe(bodyAfterFirst)
+    expect(harAfterSecond).toBe(harAfterFirst)
   })
 })

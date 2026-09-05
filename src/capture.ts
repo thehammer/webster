@@ -2,6 +2,7 @@ import { mkdirSync, rmSync, readdirSync, statSync, appendFileSync, readFileSync,
 import { join } from 'path'
 import { homedir } from 'os'
 import type { CaptureEventKind } from './protocol.js'
+import { writeHarToSession } from './har.js'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -520,43 +521,217 @@ export function readSessionEvents(sessionDir: string): CaptureEvent[] {
 function mimeTypeToExt(mime?: string): string {
   if (!mime) return '.bin'
   const m = mime.toLowerCase()
+  if (m.includes('json')) return '.json'
+  if (m.includes('html')) return '.html'
+  if (m.includes('xml')) return '.xml'
+  if (m.includes('csv')) return '.csv'
+  if (m.includes('svg')) return '.svg'
   if (m.includes('png')) return '.png'
   if (m.includes('jpeg') || m.includes('jpg')) return '.jpg'
   if (m.includes('gif')) return '.gif'
   if (m.includes('webp')) return '.webp'
   if (m.includes('pdf')) return '.pdf'
   if (m.includes('zip')) return '.zip'
-  if (m.includes('svg')) return '.svg'
   if (m.includes('woff2')) return '.woff2'
   if (m.includes('woff')) return '.woff'
   if (m.includes('mp4')) return '.mp4'
   if (m.includes('webm')) return '.webm'
   if (m.includes('mpeg') || m.includes('mp3')) return '.mp3'
+  if (m.includes('text/plain')) return '.txt'
   return '.bin'
 }
 
+// Body file extensions that hold text a regex can safely rewrite in place.
+// This is the redactable-text complement to mimeTypeToExt's mapping: every
+// extension mimeTypeToExt can produce for a *binary* format (.png, .pdf,
+// .zip, .woff, .mp4, …) — plus its catch-all `.bin` and extensionless files —
+// is deliberately absent here and treated as binary. Applying regex to
+// binary bytes doesn't reliably redact anything and can corrupt the file, so
+// when in doubt this returns false and the caller reports the file as
+// not covered rather than risk it.
+const TEXT_BODY_EXTS = new Set(['.json', '.txt', '.html', '.htm', '.xml', '.csv', '.svg'])
+
+function isRedactableBodyExt(filename: string): boolean {
+  const idx = filename.lastIndexOf('.')
+  if (idx < 0) return false
+  return TEXT_BODY_EXTS.has(filename.slice(idx).toLowerCase())
+}
+
+export interface RedactionResult {
+  /** Legacy field, kept for compatibility: number of events rewritten. */
+  eventsRedacted: number
+  /** Number of regex patterns applied (0 means redaction was a no-op). */
+  patternCount: number
+  /** Text bodies under bodies/ that were successfully redacted in place. */
+  bodiesRedacted: number
+  /** Body filenames NOT covered — binary format, or unreadable/undecodable. */
+  bodiesSkipped: string[]
+  /** True iff session.har existed and was regenerated from redacted events. */
+  harRegenerated: boolean
+  /** Number of files in frames/ — screenshots are never redactable. */
+  frameCount: number
+  /**
+   * True only when every location was fully covered: no binary body was
+   * skipped, no frames exist, no body file errored, and any pre-existing
+   * session.har was regenerated. False means PHI may remain in bodies/ or
+   * frames/ — callers that gate on "verified redacted" must check this
+   * flag, not merely that redaction ran.
+   */
+  complete: boolean
+}
+
+/** RedactionResult for the "nothing to do" early-exit paths of redactSessionDir. */
+function emptyRedactionResult(frameCount: number): RedactionResult {
+  return {
+    eventsRedacted: 0,
+    patternCount: 0,
+    bodiesRedacted: 0,
+    bodiesSkipped: [],
+    harRegenerated: false,
+    frameCount,
+    complete: false,
+  }
+}
+
 /**
- * Rewrite a session directory on disk, redacting events.jsonl according to
- * `patterns`. Appends a redaction marker to meta.json. Used by redact_capture.
+ * Stamp meta.json with the redaction accounting: the legacy `redactedAt` /
+ * `redactPatternCount` keys, plus the full `redaction` block (same fields as
+ * `result`, with `redactedAt` added). No-op if meta.json is missing or corrupt.
  */
-export function redactSessionDir(dir: string, patterns: string[]): { eventsRedacted: number } {
+function writeRedactionMeta(metaPath: string, result: RedactionResult): void {
+  if (!existsSync(metaPath)) return
+  try {
+    const meta = JSON.parse(readFileSync(metaPath, 'utf-8'))
+    const redactedAt = new Date().toISOString()
+    meta.redactedAt = redactedAt
+    meta.redactPatternCount = result.patternCount
+    meta.redaction = { redactedAt, ...result }
+    writeFileSync(metaPath, JSON.stringify(meta, null, 2))
+  } catch { /* leave meta alone if corrupt */ }
+}
+
+function countFrames(dir: string): number {
+  const framesDir = join(dir, 'frames')
+  if (!existsSync(framesDir)) return 0
+  try {
+    return readdirSync(framesDir).length
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Redact text bodies under dir/bodies/ in place. Binary bodies (per
+ * isRedactableBodyExt) are left byte-identical and reported in
+ * `bodiesSkipped`, as is any file that fails to read/decode — one bad file
+ * must not abort redaction of the rest of the session.
+ */
+function redactBodiesDir(dir: string, regexes: RegExp[]): { bodiesRedacted: number; bodiesSkipped: string[] } {
+  const bodiesDir = join(dir, 'bodies')
+  const result = { bodiesRedacted: 0, bodiesSkipped: [] as string[] }
+  if (!existsSync(bodiesDir)) return result
+
+  let filenames: string[]
+  try {
+    filenames = readdirSync(bodiesDir)
+  } catch {
+    return result
+  }
+
+  for (const filename of filenames) {
+    if (!isRedactableBodyExt(filename)) {
+      result.bodiesSkipped.push(filename)
+      continue
+    }
+    const filePath = join(bodiesDir, filename)
+    try {
+      const content = readFileSync(filePath, 'utf-8')
+      const redacted = redactString(content, regexes)
+      if (redacted !== content) {
+        writeFileSync(filePath, redacted)
+      }
+      result.bodiesRedacted++
+    } catch {
+      // Unreadable/undecodable file — report it, don't abort the rest.
+      result.bodiesSkipped.push(filename)
+    }
+  }
+  return result
+}
+
+/** Regenerate dir/session.har from `events` if (and only if) it already existed. */
+function regenerateHar(dir: string, events: CaptureEvent[]): boolean {
+  const harPath = join(dir, 'session.har')
+  if (!existsSync(harPath)) return false
+  try {
+    writeHarToSession(dir, events)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Rewrite a session directory on disk, redacting sensitive text wherever
+ * regex redaction can safely reach it:
+ *
+ *  - events.jsonl — every event rewritten (as before).
+ *  - bodies/      — text bodies (.json/.txt/.html/.htm/.xml/.csv/.svg) are
+ *                   redacted in place; binary bodies (PDF, images, zips,
+ *                   fonts, media) are left byte-identical — regex cannot
+ *                   safely redact bytes — and reported in `bodiesSkipped`.
+ *  - session.har  — regenerated from the redacted events if it already
+ *                   existed; never created if it didn't.
+ *  - frames/      — NEVER touched. JPEG screenshots may contain PHI that no
+ *                   text redaction can remove; `frameCount` reports how many
+ *                   exist so a caller can decide what to do about them.
+ *
+ * The legacy `eventsRedacted` return field and the legacy `meta.redactedAt` /
+ * `meta.redactPatternCount` keys are preserved with their original meaning.
+ * A new `redaction` block on meta.json (and this function's return value)
+ * carries the full accounting.
+ *
+ * `complete` is true only when nothing was left uncovered: no binary body
+ * skipped, no frames present, no body errored, and any pre-existing HAR was
+ * regenerated. A caller gating on "safe to share" must check `complete`, not
+ * just that this function was called.
+ *
+ * Idempotent: running this twice with the same patterns is a no-op on the
+ * second pass — already-redacted text has no further matches, and the HAR is
+ * regenerated from already-redacted events.
+ */
+export function redactSessionDir(dir: string, patterns: string[]): RedactionResult {
+  const frameCount = countFrames(dir)
   const eventsPath = join(dir, 'events.jsonl')
   const metaPath = join(dir, 'meta.json')
-  if (!existsSync(eventsPath)) return { eventsRedacted: 0 }
+
+  if (!existsSync(eventsPath)) return emptyRedactionResult(frameCount)
   const regexes = compilePatterns(patterns)
-  if (!regexes.length) return { eventsRedacted: 0 }
+  if (!regexes.length) return emptyRedactionResult(frameCount)
+
   const events = loadEvents(eventsPath)
-  const redacted = events.map(e => redactObject(e, regexes) as CaptureEvent)
-  writeFileSync(eventsPath, serializeEvents(redacted))
-  if (existsSync(metaPath)) {
-    try {
-      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'))
-      meta.redactedAt = new Date().toISOString()
-      meta.redactPatternCount = patterns.length
-      writeFileSync(metaPath, JSON.stringify(meta, null, 2))
-    } catch { /* leave meta alone if corrupt */ }
+  const redactedEvents = events.map(e => redactObject(e, regexes) as CaptureEvent)
+  writeFileSync(eventsPath, serializeEvents(redactedEvents))
+
+  const { bodiesRedacted, bodiesSkipped } = redactBodiesDir(dir, regexes)
+
+  const hadHar = existsSync(join(dir, 'session.har'))
+  const harRegenerated = hadHar ? regenerateHar(dir, redactedEvents) : false
+  const harOk = !hadHar || harRegenerated
+
+  const result: RedactionResult = {
+    eventsRedacted: redactedEvents.length,
+    patternCount: patterns.length,
+    bodiesRedacted,
+    bodiesSkipped,
+    harRegenerated,
+    frameCount,
+    complete: bodiesSkipped.length === 0 && frameCount === 0 && harOk,
   }
-  return { eventsRedacted: events.length }
+
+  writeRedactionMeta(metaPath, result)
+
+  return result
 }
 
 // ─── Lifecycle helpers ────────────────────────────────────────────────────────
