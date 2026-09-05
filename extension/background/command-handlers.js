@@ -17,6 +17,7 @@ const MAX_NETWORK_LOG = 500
 let captureActive = false
 let capturePending = new Map()   // requestId -> partial entry (waiting for response body)
 let capturedTabs = new Set()     // tabIds with debugger attached
+let capturedTabUrls = new Map()  // tabId -> URL at attach time (for detach reporting; kept in lockstep with capturedTabs)
 let captureUrlFilter = null      // only capture URLs containing this string
 let captureInputEnabled = false  // when true, periodically drain input events from tabs
 let captureInputInterval = null  // interval handle for input draining
@@ -108,6 +109,19 @@ function emitCaptureMeta(code, message, extra = {}) {
   } catch { /* server may be gone — best effort */ }
 }
 
+// Keep capturedTabs and capturedTabUrls in lockstep — every place that adds or
+// removes a tab from one must do the same to the other, or capturedTabUrls
+// leaks (a slow memory leak in a long-lived service worker) or goes stale.
+function rememberCapturedTab(tabId, url) {
+  capturedTabs.add(tabId)
+  capturedTabUrls.set(tabId, url)
+}
+
+function forgetCapturedTab(tabId) {
+  capturedTabs.delete(tabId)
+  capturedTabUrls.delete(tabId)
+}
+
 async function attachDebuggerToTab(tabId) {
   if (capturedTabs.has(tabId)) return
   let tabUrl = null
@@ -130,7 +144,7 @@ async function attachDebuggerToTab(tabId) {
 
   try {
     await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {})
-    capturedTabs.add(tabId)
+    rememberCapturedTab(tabId, tabUrl)
     if (captureDomMode === 'onNavigate' || captureDomMode === 'periodic') {
       captureDomSnapshot(tabId, 'attach')
     }
@@ -153,7 +167,7 @@ async function detachDebuggerFromTab(tabId) {
   try {
     await chrome.debugger.detach({ tabId })
   } catch { /* ignore */ }
-  capturedTabs.delete(tabId)
+  forgetCapturedTab(tabId)
 }
 
 function onCaptureTabCreated(tab) {
@@ -669,13 +683,33 @@ function stopInputDraining() {
 
 // Clean up when a debugged tab closes
 chrome.tabs.onRemoved.addListener((tabId) => {
-  capturedTabs.delete(tabId)
+  forgetCapturedTab(tabId)
 })
 
-// Clean up when debugger is detached (user clicked "cancel" on infobar, or DevTools opened)
+// Clean up when debugger is detached (user clicked "cancel" on infobar, DevTools
+// opened, tab crashed, or the tab closed). chrome.debugger.onDetach fires globally
+// for ANY debugger detach — including withDebugger's one-shot attach/detach for
+// commands like screenshots — so we only emit when the detaching tab was actually
+// held by an active deep-capture session (capturedTabs.has(...)). A detach on a
+// tab we don't hold is benign background noise, not a capture failure.
+//
+// Note: chrome.tabs.onRemoved (above) and this listener both fire when a captured
+// tab closes, in unspecified order. If onRemoved wins first, capturedTabs.has()
+// below is already false and this listener silently no-ops — that's fine, a
+// closed tab is a benign, self-explanatory loss. If this listener wins first, it
+// emits cdp_detached with reason 'target_closed', which downstream analysis can
+// filter as benign. Both outcomes are acceptable; do not add cross-listener
+// coordination to force one order.
 if (chrome.debugger?.onDetach) {
-  chrome.debugger.onDetach.addListener((source) => {
-    capturedTabs.delete(source.tabId)
+  chrome.debugger.onDetach.addListener((source, reason) => {
+    const wasCaptured = capturedTabs.has(source.tabId)
+    const url = capturedTabUrls.get(source.tabId) ?? null
+    forgetCapturedTab(source.tabId)
+    if (wasCaptured) {
+      emitCaptureMeta('cdp_detached',
+        `CDP detached from tab ${source.tabId} (${url}) mid-capture — request/response bodies after this point are NOT captured for this tab. Reason: ${reason || 'unknown'}`,
+        { tabId: source.tabId, url, reason })
+    }
   })
 }
 
@@ -1231,6 +1265,7 @@ export async function executeCommand(command) {
         captureActive = true
         capturePending = new Map()
         capturedTabs = new Set()
+        capturedTabUrls = new Map()
         captureUrlFilter = command.urlFilter || null
         captureMonotonicCalibrated = false
         captureRecordingFrames = false
@@ -1402,6 +1437,7 @@ export async function executeCommand(command) {
         // Detach debuggers — can now safely await since we don't return data
         const tabsToDetach = [...capturedTabs]
         capturedTabs.clear()
+        capturedTabUrls.clear()
         await Promise.allSettled(tabsToDetach.map(tabId => detachDebuggerFromTab(tabId)))
 
         return { success: true, data: { stopped: true } }
