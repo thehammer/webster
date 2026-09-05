@@ -101,6 +101,29 @@ Capture also records:
 - Page state (URL, title, scroll, viewport)
 - DOM cursor overlay for visible mouse in frame recordings
 
+### Retention
+
+Capture directories routinely hold sensitive data, so the running server
+expires them. The sweep runs **on startup and then hourly**, and deletion is
+**two-phase** — a session is never deleted the first time the sweep sees it:
+
+1. **Age.** A session whose directory mtime is older than **24 hours**
+   (`WEBSTER_RETENTION_HOURS`) becomes eligible for eviction.
+2. **Grace notice.** The first sweep to see an eligible session stamps
+   `meta.json` with `retentionWarnedAt` and `retentionExpiresAt` (now + **24
+   hours**) and logs a warning naming the session. Nothing is deleted.
+3. **Deletion.** A later sweep, once `retentionExpiresAt` is in the past,
+   removes the directory and logs the deletion.
+
+So worst-case retention is ~48 hours, and **the first sweep after an upgrade
+deletes nothing** — every pre-existing session gets a full grace window first.
+
+The sweep never touches the live capture session, a directory without a
+`meta.json`, or one whose `meta.json` won't parse. Retention is opt-in at the
+constructor (`new WebsterServer(port, timeout, { retention: true })`) and is
+enabled only by `src/index.ts` — tests construct servers with it off, so no
+test can sweep real capture data.
+
 ## HTTP API
 
 | Method | Path | Description |
@@ -189,6 +212,7 @@ cd menubar && swift build && .build/debug/WebsterMenu
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WEBSTER_PORT` | `3456` | Port for WebSocket, MCP HTTP, dashboard, and replay viewer |
+| `WEBSTER_RETENTION_HOURS` | `24` | Age at which a capture becomes eligible for deletion (plus a 24h grace notice). `0` disables deletion — retain indefinitely |
 
 ## Hard Rules
 

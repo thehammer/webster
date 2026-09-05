@@ -5,7 +5,7 @@ import {
   isResult, isCaptureEvent, isCaptureDone, isCaptureBody, isCapturePush,
   type WsCommand, type WsMessage, type WsCaptureEvent, type WsCaptureDone, type WsCaptureBody,
 } from './protocol.js'
-import { CaptureSession, cleanOldSessions, CAPTURES_DIR, parseCaptureConfig, type CaptureConfig, type CaptureEvent } from './capture.js'
+import { CaptureSession, cleanOldSessions, CAPTURES_DIR, parseCaptureConfig, type CaptureConfig, type CaptureEvent, type RetentionOptions } from './capture.js'
 import { buildStartCaptureResult, startCaptureDispatchFailureMessage } from './capture-result.js'
 import { handleReplayRequest } from './replay.js'
 import { buildDashboardHtml } from './dashboard.js'
@@ -23,6 +23,9 @@ interface RegistryEntry {
 
 const REGISTRY_DIR = join(homedir(), '.webster')
 const REGISTRY_FILE = join(REGISTRY_DIR, 'registry.json')
+
+/** How often the server re-runs the capture retention sweep. */
+const RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1000 // hourly
 
 function readRegistry(): RegistryEntry[] {
   try {
@@ -82,9 +85,22 @@ export class WebsterServer {
   private captureSession: CaptureSession | null = null
   private startedAt = Date.now()
 
-  constructor(port: number, commandTimeout = 30000) {
+  // Retention sweep — opt-in only. Constructing a server must never start a
+  // destructive timer by default: the test suite builds a dozen servers, and a
+  // default-on sweep would point them all at the operator's real captures.
+  private retentionTimer: ReturnType<typeof setInterval> | null = null
+  private retentionOptions: RetentionOptions | null = null
+
+  constructor(port: number, commandTimeout = 30000, options?: { retention?: boolean | RetentionOptions }) {
     this.commandTimeout = commandTimeout
-    cleanOldSessions()
+
+    if (options?.retention) {
+      this.retentionOptions = options.retention === true ? {} : options.retention
+      this.sweepRetention() // sweep once at startup, as the old constructor did
+      this.retentionTimer = setInterval(() => this.sweepRetention(), RETENTION_SWEEP_INTERVAL_MS)
+      // Never let the sweep timer hold the process open.
+      this.retentionTimer.unref?.()
+    }
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     this.server = (Bun.serve as any)({
@@ -602,6 +618,25 @@ export class WebsterServer {
     }
   }
 
+  // ─── Retention ────────────────────────────────────────────────────────
+
+  /** True while a retention sweep timer is armed. Off unless opted in. */
+  get retentionEnabled(): boolean {
+    return this.retentionTimer !== null
+  }
+
+  /**
+   * Run one retention sweep, always excluding the live capture — its
+   * CaptureSession holds absolute paths and appends as it goes, so removing
+   * the directory underneath it corrupts the session.
+   */
+  private sweepRetention(): void {
+    if (!this.retentionOptions) return
+    const excludeIds = [...(this.retentionOptions.excludeIds ?? [])]
+    if (this.captureSession) excludeIds.push(this.captureSession.id)
+    cleanOldSessions({ ...this.retentionOptions, excludeIds })
+  }
+
   // ─── Session listing ──────────────────────────────────────────────────
 
   private countSessions(): number {
@@ -636,6 +671,10 @@ export class WebsterServer {
   }
 
   close(): void {
+    if (this.retentionTimer) {
+      clearInterval(this.retentionTimer)
+      this.retentionTimer = null
+    }
     if (this.captureSession?.active) {
       this.captureSession.finalize()
     }
