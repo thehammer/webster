@@ -583,17 +583,11 @@ export class CaptureSession {
 
     if (this.redactPatterns.length) {
       const events = loadEvents(this.eventsPath)
-      const harStatus = regenerateHar(this.dir, events)
-      const { bodiesCovered, bodiesChanged, bodiesSkipped } = redactBodiesDir(this.dir, this.regexes)
       const frameCount = countFrames(this.dir)
-      const encodedPayloadsSkipped = [...this.encodedPayloadsSkipped]
-      const { complete } = computeCompleteness({
-        bodiesSkipped,
-        encodedPayloadsSkipped,
-        frameCount,
-        harStatus,
-        patternsInvalid: this.patternsInvalid,
-        regexCount: this.regexes.length,
+      const rest = finishRedaction(this.dir, events, this.regexes, this.patternsInvalid, frameCount, {
+        covered: this.encodedPayloadsCovered,
+        skipped: [...this.encodedPayloadsSkipped],
+        skippedCount: this.encodedPayloadsSkippedCount,
       })
 
       const redactedAt = new Date().toISOString()
@@ -603,16 +597,7 @@ export class CaptureSession {
         redactedAt,
         eventsRedacted: this.eventCount,
         patternCount: this.regexes.length,
-        patternsInvalid: this.patternsInvalid,
-        bodiesCovered,
-        bodiesChanged,
-        bodiesSkipped,
-        encodedPayloadsCovered: this.encodedPayloadsCovered,
-        encodedPayloadsSkipped,
-        encodedPayloadsSkippedCount: this.encodedPayloadsSkippedCount,
-        harRegenerated: harStatus === 'regenerated',
-        frameCount,
-        complete,
+        ...rest,
       }
     }
 
@@ -759,6 +744,54 @@ function emptyRedactionResult(frameCount: number, patternsInvalid: string[] = []
     harRegenerated: false,
     frameCount,
     complete: false,
+  }
+}
+
+/** Encoded-payload coverage accounting handed to {@link finishRedaction}. */
+interface EncodedPayloadAccounting {
+  covered: number
+  skipped: string[]
+  skippedCount: number
+}
+
+/**
+ * Finish redacting a session dir, given events that are already redacted and
+ * the encoded-payload accounting for them. Covers the part of a
+ * `RedactionResult` that both `redactSessionDir` and `CaptureSession.finalize`
+ * need identically — bodies/, session.har, frame count, and the completeness
+ * decision — whether the events were just redacted in bulk (`redactSessionDir`)
+ * or redacted incrementally as they were appended (the live capture path).
+ */
+function finishRedaction(
+  dir: string,
+  events: CaptureEvent[],
+  regexes: RegExp[],
+  patternsInvalid: string[],
+  frameCount: number,
+  encodedPayloads: EncodedPayloadAccounting
+): Omit<RedactionResult, 'eventsRedacted' | 'patternCount'> {
+  const { bodiesCovered, bodiesChanged, bodiesSkipped } = redactBodiesDir(dir, regexes)
+  const harStatus = regenerateHar(dir, events)
+  const { complete } = computeCompleteness({
+    bodiesSkipped,
+    encodedPayloadsSkipped: encodedPayloads.skipped,
+    frameCount,
+    harStatus,
+    patternsInvalid,
+    regexCount: regexes.length,
+  })
+
+  return {
+    patternsInvalid,
+    bodiesCovered,
+    bodiesChanged,
+    bodiesSkipped,
+    encodedPayloadsCovered: encodedPayloads.covered,
+    encodedPayloadsSkipped: encodedPayloads.skipped,
+    encodedPayloadsSkippedCount: encodedPayloads.skippedCount,
+    harRegenerated: harStatus === 'regenerated',
+    frameCount,
+    complete,
   }
 }
 
@@ -913,32 +946,16 @@ export function redactSessionDir(dir: string, patterns: string[]): RedactionResu
   })
   writeFileSync(eventsPath, serializeEvents(redactedEvents))
 
-  const { bodiesCovered, bodiesChanged, bodiesSkipped } = redactBodiesDir(dir, regexes)
-
-  const harStatus = regenerateHar(dir, redactedEvents)
-  const encodedPayloadsSkipped = [...encodedPayloadsSkippedSet]
-  const { complete } = computeCompleteness({
-    bodiesSkipped,
-    encodedPayloadsSkipped,
-    frameCount,
-    harStatus,
-    patternsInvalid,
-    regexCount: regexes.length,
+  const rest = finishRedaction(dir, redactedEvents, regexes, patternsInvalid, frameCount, {
+    covered: encodedPayloadsCovered,
+    skipped: [...encodedPayloadsSkippedSet],
+    skippedCount: encodedPayloadsSkippedCount,
   })
 
   const result: RedactionResult = {
     eventsRedacted: redactedEvents.length,
     patternCount: regexes.length,
-    patternsInvalid,
-    bodiesCovered,
-    bodiesChanged,
-    bodiesSkipped,
-    encodedPayloadsCovered,
-    encodedPayloadsSkipped,
-    encodedPayloadsSkippedCount,
-    harRegenerated: harStatus === 'regenerated',
-    frameCount,
-    complete,
+    ...rest,
   }
 
   writeRedactionMeta(metaPath, result)

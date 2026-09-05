@@ -737,6 +737,20 @@ function readEventsRaw(path: string): CaptureEvent[] {
   return raw.split('\n').filter(Boolean).map(line => JSON.parse(line) as CaptureEvent)
 }
 
+/** Build a base64 WebSocket binary (opcode 2) frame event carrying `encodedPayload`. */
+function wsBinaryFrameEvent(encodedPayload: string, overrides: Partial<CaptureEvent> = {}): CaptureEvent {
+  return {
+    kind: 'websocket',
+    timestamp: Date.now(),
+    url: 'wss://example.com/socket',
+    subKind: 'frame',
+    opcode: 2,
+    payloadEncoding: 'base64',
+    payload: encodedPayload,
+    ...overrides,
+  }
+}
+
 describe('redactSessionDir — encoded payload coverage honesty', () => {
   let s: CaptureSession
 
@@ -750,16 +764,7 @@ describe('redactSessionDir — encoded payload coverage honesty', () => {
 
   test('complete is false when a base64 WebSocket frame payload contains an unredacted secret (blocking regression)', () => {
     const originalPayload = Buffer.from('handshake secret-9999 payload').toString('base64')
-    s.appendEvent({
-      kind: 'websocket',
-      timestamp: Date.now(),
-      url: 'wss://example.com/socket',
-      subKind: 'frame',
-      direction: 'receive',
-      opcode: 2,
-      payloadEncoding: 'base64',
-      payload: originalPayload,
-    })
+    s.appendEvent(wsBinaryFrameEvent(originalPayload, { direction: 'receive' }))
 
     const res = redactSessionDir(s.dir, ['secret-9999'])
     expect(res.complete).toBe(false)
@@ -837,15 +842,7 @@ describe('redactSessionDir — encoded payload coverage honesty', () => {
 
   test('field-scoped skip: a base64 WebSocket payload stays untouched while the url field on the same event is still redacted', () => {
     const originalPayload = Buffer.from('binary-ish frame data').toString('base64')
-    s.appendEvent({
-      kind: 'websocket',
-      timestamp: Date.now(),
-      url: 'wss://example.com/socket?token=secret-9999',
-      subKind: 'frame',
-      opcode: 2,
-      payloadEncoding: 'base64',
-      payload: originalPayload,
-    })
+    s.appendEvent(wsBinaryFrameEvent(originalPayload, { url: 'wss://example.com/socket?token=secret-9999' }))
 
     redactSessionDir(s.dir, ['secret-9999'])
 
@@ -937,15 +934,7 @@ describe('redactSessionDir — encoded payload coverage honesty', () => {
     })
 
     const wsPayload = Buffer.from('secret-9999 binary-ish frame').toString('base64')
-    s.appendEvent({
-      kind: 'websocket',
-      timestamp: Date.now(),
-      url: 'wss://example.com/socket',
-      subKind: 'frame',
-      opcode: 2,
-      payloadEncoding: 'base64',
-      payload: wsPayload,
-    })
+    s.appendEvent(wsBinaryFrameEvent(wsPayload))
 
     const ref = s.appendBody('req-json', Buffer.from(JSON.stringify({ ssn: 'secret-9999' })), 'application/json')!
     writeHarToSession(s.dir, s.readEvents())
@@ -997,15 +986,7 @@ describe('CaptureSession.finalize writes the same redaction accounting as redact
     const live = new CaptureSession(`live-redact-${Date.now()}-${Math.random()}`, { redact: [secret] })
     try {
       const wsPayload = Buffer.from(`frame carrying ${secret}`).toString('base64')
-      live.appendEvent({
-        kind: 'websocket',
-        timestamp: Date.now(),
-        url: 'wss://example.com/socket',
-        subKind: 'frame',
-        opcode: 2,
-        payloadEncoding: 'base64',
-        payload: wsPayload,
-      })
+      live.appendEvent(wsBinaryFrameEvent(wsPayload))
       live.appendEvent({
         kind: 'console',
         timestamp: Date.now(),
