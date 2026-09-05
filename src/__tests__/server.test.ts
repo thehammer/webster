@@ -224,3 +224,62 @@ describe('capture push events', () => {
     server.close()
   })
 })
+
+describe('POST /api/capture/start', () => {
+  test('returns tabsAttached and warnings alongside the existing snapshot fields', async () => {
+    const port = await findFreePort()
+    const server = new WebsterServer(port, 500)
+    const ws = await connectAndHandshake(port)
+
+    ws.onmessage = (event) => {
+      const cmd = JSON.parse(event.data)
+      if (cmd.action === 'startCapture') {
+        ws.send(JSON.stringify({ id: cmd.id, success: true, data: { tabsAttached: 0, urlFilter: null } }))
+      }
+    }
+
+    const res = await fetch(`http://localhost:${port}/api/capture/start`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+      headers: { 'content-type': 'application/json' },
+    })
+    const body = await res.json() as { tabsAttached: number; warnings: string[]; sessionId: string; active: boolean }
+
+    expect(res.status).toBe(200)
+    expect(body.tabsAttached).toBe(0)
+    expect(Array.isArray(body.warnings)).toBe(true)
+    expect(body.warnings.length).toBeGreaterThan(0)
+    expect(body.sessionId).toBeTruthy()
+    expect(body.active).toBe(true)
+
+    server.getCaptureSession()?.cleanup()
+    ws.close()
+    server.close()
+  })
+
+  test('dispatch failure returns an error response and leaves no orphaned active session', async () => {
+    const port = await findFreePort()
+    const server = new WebsterServer(port, 500)
+    const ws = await connectAndHandshake(port)
+
+    ws.onmessage = (event) => {
+      const cmd = JSON.parse(event.data)
+      if (cmd.action === 'startCapture') {
+        ws.send(JSON.stringify({ id: cmd.id, success: false, error: 'extension not responding' }))
+      }
+    }
+
+    const res = await fetch(`http://localhost:${port}/api/capture/start`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+      headers: { 'content-type': 'application/json' },
+    })
+
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    expect(server.getCaptureSession()?.active).toBe(false)
+
+    server.getCaptureSession()?.cleanup()
+    ws.close()
+    server.close()
+  })
+})
