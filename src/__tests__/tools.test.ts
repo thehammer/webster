@@ -183,3 +183,185 @@ describe('createTools', () => {
     }
   })
 })
+
+describe('start_capture tabsAttached/warnings', () => {
+  test('tabsAttached === 0 produces a non-empty warnings array mentioning 0 tabs and no bodies recorded', async () => {
+    const session = new CaptureSession('test-tools-zero-tabs', { urlFilter: null })
+    const localServer = {
+      dispatch: async (_cmd: Record<string, unknown>) => ({ tabsAttached: 0, urlFilter: null }),
+      startCaptureSession: () => session,
+      getCaptureSession: () => session,
+      stopCaptureSession: () => session,
+      isConnected: () => true,
+    } as unknown as WebsterServer
+    const localTools = createTools(localServer)
+    const startCapture = localTools.find(t => t.name === 'start_capture')!
+
+    try {
+      const result = await startCapture.execute({}) as { tabsAttached: number; warnings: string[] }
+      expect(result.tabsAttached).toBe(0)
+      expect(Array.isArray(result.warnings)).toBe(true)
+      expect(result.warnings.length).toBeGreaterThan(0)
+      const joined = result.warnings.join(' ').toLowerCase()
+      expect(joined).toMatch(/0 tabs|no tabs/)
+      expect(joined).toMatch(/bodies|body/)
+    } finally {
+      session.cleanup()
+    }
+  })
+
+  test('tabsAttached === 3 with no meta warnings produces empty warnings array', async () => {
+    const session = new CaptureSession('test-tools-three-tabs', { urlFilter: null })
+    const localServer = {
+      dispatch: async (_cmd: Record<string, unknown>) => ({ tabsAttached: 3 }),
+      startCaptureSession: () => session,
+      getCaptureSession: () => session,
+      stopCaptureSession: () => session,
+      isConnected: () => true,
+    } as unknown as WebsterServer
+    const localTools = createTools(localServer)
+    const startCapture = localTools.find(t => t.name === 'start_capture')!
+
+    try {
+      const result = await startCapture.execute({}) as { tabsAttached: number; warnings: string[] }
+      expect(result.tabsAttached).toBe(3)
+      expect(result.warnings).toEqual([])
+    } finally {
+      session.cleanup()
+    }
+  })
+
+  test('pre-existing cdp_unavailable meta warning is folded into warnings even with nonzero tabsAttached', async () => {
+    const session = new CaptureSession('test-tools-meta-warning', { urlFilter: null })
+    session.appendEvent({
+      kind: 'meta',
+      timestamp: Date.now(),
+      subKind: 'warning',
+      code: 'cdp_unavailable',
+      message: 'CDP debugger unavailable on tab 42 — capture may be incomplete',
+    })
+    const localServer = {
+      dispatch: async (_cmd: Record<string, unknown>) => ({ tabsAttached: 2 }),
+      startCaptureSession: () => session,
+      getCaptureSession: () => session,
+      stopCaptureSession: () => session,
+      isConnected: () => true,
+    } as unknown as WebsterServer
+    const localTools = createTools(localServer)
+    const startCapture = localTools.find(t => t.name === 'start_capture')!
+
+    try {
+      const result = await startCapture.execute({}) as { tabsAttached: number; warnings: string[] }
+      expect(result.tabsAttached).toBe(2)
+      const joined = result.warnings.join(' ')
+      expect(joined).toContain('CDP debugger unavailable on tab 42 — capture may be incomplete')
+    } finally {
+      session.cleanup()
+    }
+  })
+
+  test('extension dispatch rejection prevents an orphaned active session and surfaces the underlying error', async () => {
+    const session = new CaptureSession('test-tools-dispatch-fail', { urlFilter: null })
+    let stopCalled = false
+    const localServer = {
+      dispatch: async (_cmd: Record<string, unknown>) => { throw new Error('extension not responding') },
+      startCaptureSession: () => session,
+      getCaptureSession: () => session,
+      stopCaptureSession: () => { stopCalled = true; session.finalize(); return session },
+      isConnected: () => true,
+    } as unknown as WebsterServer
+    const localTools = createTools(localServer)
+    const startCapture = localTools.find(t => t.name === 'start_capture')!
+
+    try {
+      await expect(startCapture.execute({})).rejects.toThrow('extension not responding')
+      expect(stopCalled).toBe(true)
+    } finally {
+      session.cleanup()
+    }
+  })
+})
+
+describe('get_capture extension probe', () => {
+  test('active session + connected extension includes nested extension field from live probe', async () => {
+    const session = new CaptureSession('test-tools-get-capture-probe', { urlFilter: null })
+    const localServer = {
+      dispatch: async (_cmd: Record<string, unknown>) => ({ active: true, pendingRequests: 2, tabsAttached: 4 }),
+      getCaptureSession: () => session,
+      isConnected: () => true,
+    } as unknown as WebsterServer
+    const localTools = createTools(localServer)
+    const getCapture = localTools.find(t => t.name === 'get_capture')!
+
+    try {
+      const result = await getCapture.execute({}) as { sessionId: string; extension?: { tabsAttached: number; pendingRequests: number } }
+      expect(result.extension).toBeTruthy()
+      expect(result.extension!.tabsAttached).toBe(4)
+      expect(result.extension!.pendingRequests).toBe(2)
+    } finally {
+      session.cleanup()
+    }
+  })
+
+  test('probe rejection still resolves with plain snapshot, no extension field, no throw', async () => {
+    const session = new CaptureSession('test-tools-get-capture-probe-fail', { urlFilter: null })
+    const localServer = {
+      dispatch: async (_cmd: Record<string, unknown>) => { throw new Error('probe timed out') },
+      getCaptureSession: () => session,
+      isConnected: () => true,
+    } as unknown as WebsterServer
+    const localTools = createTools(localServer)
+    const getCapture = localTools.find(t => t.name === 'get_capture')!
+
+    try {
+      const result = await getCapture.execute({}) as { sessionId: string; extension?: unknown }
+      expect(result.sessionId).toBe(session.id)
+      expect(result.extension).toBeUndefined()
+    } finally {
+      session.cleanup()
+    }
+  })
+
+  test('extension disconnected: no probe, no extension field, no throw', async () => {
+    const session = new CaptureSession('test-tools-get-capture-disconnected', { urlFilter: null })
+    let dispatchCalls = 0
+    const localServer = {
+      dispatch: async (_cmd: Record<string, unknown>) => { dispatchCalls++; return { active: true, pendingRequests: 0, tabsAttached: 1 } },
+      getCaptureSession: () => session,
+      isConnected: () => false,
+    } as unknown as WebsterServer
+    const localTools = createTools(localServer)
+    const getCapture = localTools.find(t => t.name === 'get_capture')!
+
+    try {
+      const result = await getCapture.execute({}) as { sessionId: string; extension?: unknown }
+      expect(result.sessionId).toBe(session.id)
+      expect(result.extension).toBeUndefined()
+      expect(dispatchCalls).toBe(0)
+    } finally {
+      session.cleanup()
+    }
+  })
+
+  test('non-active (finished) session with connected extension: plain snapshot, no probe attempted', async () => {
+    const session = new CaptureSession('test-tools-get-capture-finished', { urlFilter: null })
+    session.finalize()
+    let dispatchCalls = 0
+    const localServer = {
+      dispatch: async (_cmd: Record<string, unknown>) => { dispatchCalls++; return { active: true, pendingRequests: 0, tabsAttached: 1 } },
+      getCaptureSession: () => session,
+      isConnected: () => true,
+    } as unknown as WebsterServer
+    const localTools = createTools(localServer)
+    const getCapture = localTools.find(t => t.name === 'get_capture')!
+
+    try {
+      const result = await getCapture.execute({}) as { sessionId: string; extension?: unknown }
+      expect(result.sessionId).toBe(session.id)
+      expect(result.extension).toBeUndefined()
+      expect(dispatchCalls).toBe(0)
+    } finally {
+      session.cleanup()
+    }
+  })
+})
