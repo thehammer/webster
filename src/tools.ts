@@ -629,7 +629,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'redact_capture',
-      description: 'Apply redaction patterns to an existing capture on disk. Rewrites events.jsonl in place, replacing every regex match (case-insensitive, global) with [REDACTED]. Targets URL, headers, bodies, payloads, and DOM HTML — anywhere text appears. Use this AFTER the fact when you forgot to pass redact: to start_capture, or when sharing a session externally.',
+      description: 'Apply redaction patterns to an existing capture on disk. Rewrites events.jsonl and text bodies (JSON/HTML/XML/plain text/CSV/SVG) in place, and regenerates session.har if one already exists — replacing every regex match (case-insensitive, global) with [REDACTED]. Binary bodies (PDF, images, ZIPs, fonts, audio/video) and frames/ screenshots CANNOT be redacted by regex and are left untouched; they are reported by filename/count in the result instead. Check the returned `complete` flag before treating a session as safe to share — `false` means something was left uncovered. Use this AFTER the fact when you forgot to pass redact: to start_capture, or when sharing a session externally.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -661,7 +661,18 @@ export function createTools(server: WebsterServer): WebsterTool[] {
           dir = session.dir
         }
         const result = redactSessionDir(dir, patterns)
-        return { sessionId: resolvedId, ...result }
+        const notCovered: string[] = []
+        if (result.bodiesSkipped.length) {
+          notCovered.push(`${result.bodiesSkipped.length} binary/unreadable body file(s) not redacted: ${result.bodiesSkipped.join(', ')}`)
+        }
+        if (result.frameCount > 0) {
+          notCovered.push(`${result.frameCount} screenshot frame(s) not redacted — frames/ cannot be redacted`)
+        }
+        return {
+          sessionId: resolvedId,
+          ...(notCovered.length ? { warning: `Redaction incomplete: ${notCovered.join('; ')}` } : {}),
+          ...result,
+        }
       },
     },
 
