@@ -1,4 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from 'fs'
+import { join } from 'path'
+import { tmpdir } from 'os'
 import { WebsterServer } from '../server.js'
 
 function findFreePort(): Promise<number> {
@@ -281,5 +284,76 @@ describe('POST /api/capture/start', () => {
     server.getCaptureSession()?.cleanup()
     ws.close()
     server.close()
+  })
+})
+
+// ─── Retention (startup sweep) ──────────────────────────────────────────────
+//
+// SAFETY: neither test below ever points retention at the real CAPTURES_DIR.
+// The first constructs a server with the retention default (must be
+// disabled — this suite constructs ~14 servers via `new WebsterServer(port, ...)`
+// with no retention option, and none of those may sweep real data). The
+// second explicitly redirects retention at a temp directory.
+//
+// Implementation hook assumed: WebsterServer exposes a public boolean
+// `retentionEnabled` reflecting whether a retention sweep/timer is active —
+// true only when constructed with a truthy `retention` option, and flipped
+// back to false once `close()` has cleared the interval. Cody: wire this up,
+// or swap in whatever equivalent observable you land on and adjust the
+// assertions below.
+
+describe('WebsterServer retention', () => {
+  test('a default-constructed server has retention disabled and never sweeps', async () => {
+    const port = await findFreePort()
+    const dir = mkdtempSync(join(tmpdir(), 'webster-retention-server-'))
+    const sessionDir = join(dir, 'ancient-session')
+    mkdirSync(sessionDir, { recursive: true })
+    writeFileSync(join(sessionDir, 'meta.json'), JSON.stringify({
+      id: 'ancient-session',
+      config: {},
+      startedAt: new Date(0).toISOString(),
+      status: 'finished',
+    }))
+    const ancientTime = new Date(Date.now() - 365 * 24 * 3600_000)
+    utimesSync(sessionDir, ancientTime, ancientTime)
+
+    const server = new WebsterServer(port, 500) // no retention option — the default every other test in this suite relies on
+
+    expect(server.retentionEnabled).toBe(false)
+    // This directory was never handed to the server, so it must survive
+    // regardless — but if a bug ever made the default fall back to sweeping
+    // "whatever dir it can find," this guards against that too.
+    expect(existsSync(sessionDir)).toBe(true)
+
+    server.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('a server constructed with an explicit retention dir runs a startup sweep that warns (not deletes) an over-age session, and close() clears the interval', async () => {
+    const port = await findFreePort()
+    const dir = mkdtempSync(join(tmpdir(), 'webster-retention-server-'))
+    const sessionDir = join(dir, 'over-age-session')
+    mkdirSync(sessionDir, { recursive: true })
+    writeFileSync(join(sessionDir, 'meta.json'), JSON.stringify({
+      id: 'over-age-session',
+      config: {},
+      startedAt: new Date(0).toISOString(),
+      status: 'finished',
+    }))
+    const ancientTime = new Date(Date.now() - 365 * 24 * 3600_000)
+    utimesSync(sessionDir, ancientTime, ancientTime)
+
+    const server = new WebsterServer(port, 500, { retention: { dir } })
+
+    expect(server.retentionEnabled).toBe(true)
+    // First sweep ever on this session: warned, not deleted.
+    expect(existsSync(sessionDir)).toBe(true)
+    const meta = JSON.parse(readFileSync(join(sessionDir, 'meta.json'), 'utf-8'))
+    expect(meta.retentionExpiresAt).toBeDefined()
+
+    server.close()
+    expect(server.retentionEnabled).toBe(false)
+
+    rmSync(dir, { recursive: true, force: true })
   })
 })

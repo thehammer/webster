@@ -56,7 +56,17 @@ export interface CaptureSnapshot {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 export const CAPTURES_DIR = join(homedir(), '.webster', 'captures')
+/**
+ * Age at which a capture session becomes eligible for eviction. A session
+ * older than this is not deleted on sight — it is stamped with a
+ * `retentionExpiresAt` one DEFAULT_GRACE_MS in the future and only removed by
+ * a later sweep. Actual retention is therefore MAX_AGE_MS + DEFAULT_GRACE_MS
+ * in the worst case, and the first sweep on any machine deletes nothing.
+ */
 const MAX_AGE_MS = 24 * 60 * 60 * 1000 // 24 hours
+
+/** Grace period between the eviction notice and the actual deletion. */
+export const DEFAULT_GRACE_MS = 24 * 60 * 60 * 1000 // 24 hours
 const REDACTED = '[REDACTED]'
 
 // MIME types where parsing the postData is useful for quick inspection.
@@ -734,23 +744,157 @@ export function redactSessionDir(dir: string, patterns: string[]): RedactionResu
   return result
 }
 
-// ─── Lifecycle helpers ────────────────────────────────────────────────────────
+// ─── Retention ────────────────────────────────────────────────────────────────
+
+export interface RetentionOptions {
+  /** Directory to sweep. Defaults to CAPTURES_DIR (the operator's real data). */
+  dir?: string
+  /** Clock for the sweep, injectable so tests need no sleeps. Default Date.now(). */
+  now?: number
+  /** Age at which a session becomes eligible. 0 or less disables deletion entirely. */
+  maxAgeMs?: number
+  /** Delay between the eviction notice and the deletion. Default 24h. */
+  graceMs?: number
+  /** Session ids never to touch — in practice the live capture. */
+  excludeIds?: string[]
+}
+
+export interface RetentionReport {
+  /** Newly stamped with retentionExpiresAt this sweep. Still on disk. */
+  warned: string[]
+  /** Grace expired — directory removed. */
+  deleted: string[]
+  /** Already warned, grace not yet expired. Still on disk. */
+  pending: string[]
+  /** Excluded, unreadable, or not a session directory. Never deleted. */
+  skipped: string[]
+}
+
+/** Parse dir/meta.json. Returns null if absent, unreadable, or not an object. */
+function readSessionMeta(dir: string): Record<string, unknown> | null {
+  const metaPath = join(dir, 'meta.json')
+  if (!existsSync(metaPath)) return null
+  try {
+    const parsed = JSON.parse(readFileSync(metaPath, 'utf-8'))
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+/** Write meta back verbatim. Returns false if the write failed. */
+function writeSessionMeta(dir: string, meta: Record<string, unknown>): boolean {
+  try {
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify(meta, null, 2))
+    return true
+  } catch {
+    return false
+  }
+}
+
+function formatHours(ms: number): string {
+  return `${(ms / 3600_000).toFixed(1)}h`
+}
 
 /**
- * Remove capture sessions older than MAX_AGE_MS.
- * Called on server startup.
+ * Sweep `dir` for expired capture sessions.
+ *
+ * Deletion is two-phase on purpose. Capture directories routinely hold PHI,
+ * and this sweep is the only code path in Webster that removes them without
+ * being asked. The first sweep that sees an over-age session does not delete
+ * it: it stamps meta.json with `retentionExpiresAt` (now + graceMs) and logs a
+ * warning. Only a later sweep, once that stamp is in the past, removes the
+ * directory. That makes "the first run of this code on any machine deletes
+ * nothing" true by construction rather than by convention — every existing
+ * session gets a full grace window and a logged notice first.
+ *
+ * A directory with no meta.json, or an unparseable one, is reported as skipped
+ * and never removed: a stray directory under captures/ is not a Webster
+ * session and is not ours to delete.
  */
-export function cleanOldSessions(): void {
-  if (!existsSync(CAPTURES_DIR)) return
+export function cleanOldSessions(options: RetentionOptions = {}): RetentionReport {
+  const dir = options.dir ?? CAPTURES_DIR
+  const now = options.now ?? Date.now()
+  const maxAgeMs = options.maxAgeMs ?? MAX_AGE_MS
+  const graceMs = options.graceMs ?? DEFAULT_GRACE_MS
+  const excludeIds = new Set(options.excludeIds ?? [])
 
-  const now = Date.now()
-  for (const entry of readdirSync(CAPTURES_DIR)) {
-    const dir = join(CAPTURES_DIR, entry)
-    try {
-      const stat = statSync(dir)
-      if (now - stat.mtimeMs > MAX_AGE_MS) {
-        rmSync(dir, { recursive: true, force: true })
-      }
-    } catch { /* ignore — race with another cleanup */ }
+  const report: RetentionReport = { warned: [], deleted: [], pending: [], skipped: [] }
+
+  // maxAgeMs <= 0 means "retain forever" — the operator opted out of deletion
+  // (WEBSTER_RETENTION_HOURS=0). Touch nothing, not even to warn.
+  if (maxAgeMs <= 0) return report
+  if (!existsSync(dir)) return report
+
+  let entries: string[]
+  try {
+    entries = readdirSync(dir)
+  } catch {
+    return report
   }
+
+  for (const entry of entries) {
+    // The live capture appends with absolute paths; deleting it mid-write
+    // corrupts the session in confusing ways. Never touch an excluded id.
+    if (excludeIds.has(entry)) {
+      report.skipped.push(entry)
+      continue
+    }
+
+    const sessionDir = join(dir, entry)
+
+    let ageMs: number
+    try {
+      const stat = statSync(sessionDir)
+      if (!stat.isDirectory()) {
+        report.skipped.push(entry)
+        continue
+      }
+      ageMs = now - stat.mtimeMs
+    } catch {
+      report.skipped.push(entry) // race with another cleanup, or unreadable
+      continue
+    }
+
+    const meta = readSessionMeta(sessionDir)
+    if (!meta) {
+      report.skipped.push(entry)
+      continue
+    }
+
+    if (ageMs <= maxAgeMs) continue
+
+    const stamp = meta.retentionExpiresAt
+    const expiresAt = typeof stamp === 'string' ? Date.parse(stamp) : NaN
+
+    // No stamp (or an unusable one): issue the eviction notice, delete nothing.
+    if (!Number.isFinite(expiresAt)) {
+      const expiry = new Date(now + graceMs).toISOString()
+      meta.retentionWarnedAt = new Date(now).toISOString()
+      meta.retentionExpiresAt = expiry
+      if (!writeSessionMeta(sessionDir, meta)) {
+        report.skipped.push(entry)
+        continue
+      }
+      report.warned.push(entry)
+      console.error(`Webster: capture ${entry} is ${formatHours(ageMs)} old (retention ${formatHours(maxAgeMs)}) — scheduled for deletion at ${expiry}`)
+      continue
+    }
+
+    if (now > expiresAt) {
+      try {
+        rmSync(sessionDir, { recursive: true, force: true })
+      } catch {
+        report.skipped.push(entry)
+        continue
+      }
+      report.deleted.push(entry)
+      console.error(`Webster: deleted capture ${entry} — retention grace expired at ${new Date(expiresAt).toISOString()}`)
+      continue
+    }
+
+    report.pending.push(entry)
+  }
+
+  return report
 }
