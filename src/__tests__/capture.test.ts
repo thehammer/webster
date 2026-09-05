@@ -593,7 +593,7 @@ describe('redactSessionDir', () => {
     expect(ref.path).toMatch(/\.json$/)
 
     const res = redactSessionDir(s.dir, ['secret-9999'])
-    expect(res.bodiesRedacted).toBe(1)
+    expect(res.bodiesCovered).toBe(1)
 
     const after = readFileSync(join(s.dir, ref.path), 'utf-8')
     expect(after).not.toContain('secret-9999')
@@ -696,7 +696,7 @@ describe('redactSessionDir', () => {
 
     const after = readFileSync(join(s.dir, ref.path), 'utf-8')
     expect(after).not.toContain('secret-9999')
-    expect(res.bodiesRedacted).toBe(1)
+    expect(res.bodiesCovered).toBe(1)
     expect(res.bodiesSkipped).toContain('bad-entry.json')
   })
 
@@ -721,5 +721,324 @@ describe('redactSessionDir', () => {
 
     expect(bodyAfterSecond).toBe(bodyAfterFirst)
     expect(harAfterSecond).toBe(harAfterFirst)
+  })
+})
+
+// ─── redactSessionDir — encoded payload coverage honesty ───────────────────
+//
+// `complete: true` must mean nothing was left uncovered — including secrets
+// hiding behind base64 encoding (network responseBody, WebSocket binary
+// frames) and text-extension body files that aren't actually valid UTF-8.
+// These tests pin the coverage-honesty contract described in RedactionResult.
+
+/** Parse events.jsonl straight off disk, bypassing any in-memory session state. */
+function readEventsRaw(path: string): CaptureEvent[] {
+  const raw = readFileSync(path, 'utf-8')
+  return raw.split('\n').filter(Boolean).map(line => JSON.parse(line) as CaptureEvent)
+}
+
+describe('redactSessionDir — encoded payload coverage honesty', () => {
+  let s: CaptureSession
+
+  beforeEach(() => {
+    s = new CaptureSession(`encoded-${Date.now()}-${Math.random()}`, {})
+  })
+
+  afterEach(() => {
+    s.cleanup()
+  })
+
+  test('complete is false when a base64 WebSocket frame payload contains an unredacted secret (blocking regression)', () => {
+    const originalPayload = Buffer.from('handshake secret-9999 payload').toString('base64')
+    s.appendEvent({
+      kind: 'websocket',
+      timestamp: Date.now(),
+      url: 'wss://example.com/socket',
+      subKind: 'frame',
+      direction: 'receive',
+      opcode: 2,
+      payloadEncoding: 'base64',
+      payload: originalPayload,
+    })
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+    expect(res.complete).toBe(false)
+
+    const [ev] = readEventsRaw(s.eventsPath)
+    expect(ev.payload).toBe(originalPayload)
+  })
+
+  test('base64 network responseBody is decoded, redacted, and re-encoded when the round trip is lossless', () => {
+    const secretJson = JSON.stringify({ token: 'secret-9999', ok: true })
+    const encoded = Buffer.from(secretJson, 'utf-8').toString('base64')
+    s.appendEvent({
+      kind: 'network',
+      timestamp: Date.now(),
+      url: 'https://example.com/api',
+      method: 'GET',
+      status: 200,
+      responseBody: encoded,
+      responseBodyEncoding: 'base64',
+    })
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+    expect(res.complete).toBe(true)
+    expect(res.encodedPayloadsCovered).toBeGreaterThanOrEqual(1)
+
+    const [ev] = readEventsRaw(s.eventsPath)
+    const stored = ev.responseBody as string
+    // Stored value must still be valid, canonical base64.
+    expect(Buffer.from(stored, 'base64').toString('base64')).toBe(stored)
+    const decoded = Buffer.from(stored, 'base64').toString('utf-8')
+    expect(decoded).toContain('[REDACTED]')
+    expect(decoded).not.toContain('secret-9999')
+  })
+
+  test('base64 network responseBody whose bytes are not valid UTF-8 is left byte-identical and reported skipped', () => {
+    const rawBytes = Buffer.from([0xff, 0xfe, 0x00, 0x01])
+    const encoded = rawBytes.toString('base64')
+    s.appendEvent({
+      kind: 'network',
+      timestamp: Date.now(),
+      url: 'https://example.com/api2',
+      method: 'GET',
+      status: 200,
+      responseBody: encoded,
+      responseBodyEncoding: 'base64',
+    })
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+
+    const [ev] = readEventsRaw(s.eventsPath)
+    expect(ev.responseBody).toBe(encoded)
+    expect(res.encodedPayloadsSkipped.some(d => d.includes('responseBody'))).toBe(true)
+    expect(res.complete).toBe(false)
+  })
+
+  test('base64 network responseBody ending in a truncation marker is left untouched and reported skipped', () => {
+    const truncated = Buffer.from('{"a":1,"b":2,"c":3}').toString('base64') + '...[truncated, 50000 total]'
+    s.appendEvent({
+      kind: 'network',
+      timestamp: Date.now(),
+      url: 'https://example.com/api3',
+      method: 'GET',
+      status: 200,
+      responseBody: truncated,
+      responseBodyEncoding: 'base64',
+    })
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+
+    const [ev] = readEventsRaw(s.eventsPath)
+    expect(ev.responseBody).toBe(truncated)
+    expect(res.encodedPayloadsSkipped.some(d => d.includes('responseBody'))).toBe(true)
+    expect(res.complete).toBe(false)
+  })
+
+  test('field-scoped skip: a base64 WebSocket payload stays untouched while the url field on the same event is still redacted', () => {
+    const originalPayload = Buffer.from('binary-ish frame data').toString('base64')
+    s.appendEvent({
+      kind: 'websocket',
+      timestamp: Date.now(),
+      url: 'wss://example.com/socket?token=secret-9999',
+      subKind: 'frame',
+      opcode: 2,
+      payloadEncoding: 'base64',
+      payload: originalPayload,
+    })
+
+    redactSessionDir(s.dir, ['secret-9999'])
+
+    const [ev] = readEventsRaw(s.eventsPath)
+    expect(ev.payload).toBe(originalPayload)
+    expect(ev.url).toContain('[REDACTED]')
+    expect(ev.url).not.toContain('secret-9999')
+  })
+
+  test('a utf8-encoded WebSocket frame payload is redacted normally', () => {
+    s.appendEvent({
+      kind: 'websocket',
+      timestamp: Date.now(),
+      url: 'wss://example.com/socket',
+      subKind: 'frame',
+      payloadEncoding: 'utf8',
+      payload: 'plaintext carrying secret-9999 in the clear',
+    })
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+
+    const [ev] = readEventsRaw(s.eventsPath)
+    expect(ev.payload).not.toContain('secret-9999')
+    expect(ev.payload).toContain('[REDACTED]')
+    expect(res.complete).toBe(true)
+  })
+
+  test('a malformed pattern is dropped and reported while a co-supplied valid pattern still redacts', () => {
+    s.appendEvent({ kind: 'console', timestamp: 1, text: 'leaked secret-9999 here' })
+
+    const res = redactSessionDir(s.dir, ['[', 'secret-9999'])
+    expect(res.patternCount).toBe(1)
+    expect(res.patternsInvalid).toContain('[')
+
+    const [ev] = readEventsRaw(s.eventsPath)
+    expect(ev.text).not.toContain('secret-9999')
+    expect(ev.text).toContain('[REDACTED]')
+  })
+
+  test('when every pattern is malformed, nothing is rewritten, patternCount is 0, and complete is false', () => {
+    s.appendEvent({ kind: 'console', timestamp: 1, text: 'leaked secret-9999 here' })
+    const before = readFileSync(s.eventsPath, 'utf-8')
+
+    const res = redactSessionDir(s.dir, ['[', '('])
+    expect(res.patternCount).toBe(0)
+    expect(res.patternsInvalid).toContain('[')
+    expect(res.patternsInvalid).toContain('(')
+    expect(res.complete).toBe(false)
+
+    const after = readFileSync(s.eventsPath, 'utf-8')
+    expect(after).toBe(before)
+  })
+
+  test('leaves a .json body byte-identical when its bytes are not valid UTF-8 (regression pin)', () => {
+    // Not valid UTF-8 (lone continuation bytes) and not valid JSON either —
+    // that's fine, this pins byte-safety, not JSON-validity.
+    const badBytes = Buffer.from([0x7b, 0x22, 0x61, 0x22, 0x3a, 0xff, 0xfe, 0x7d])
+    const ref = s.appendBody('req-bad-json', badBytes, 'application/json')!
+    const filename = ref.path.slice('bodies/'.length)
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+
+    const after = readFileSync(join(s.dir, ref.path))
+    expect(Buffer.compare(after, badBytes)).toBe(0)
+    expect(res.bodiesSkipped).toContain(filename)
+    expect(res.complete).toBe(false)
+  })
+
+  test('bodiesCovered counts all examined text bodies while bodiesChanged counts only those actually rewritten', () => {
+    s.appendBody('req-a', Buffer.from(JSON.stringify({ secret: 'secret-9999' })), 'application/json')
+    s.appendBody('req-b', Buffer.from(JSON.stringify({ ok: true })), 'application/json')
+
+    const res = redactSessionDir(s.dir, ['secret-9999'])
+    expect(res.bodiesCovered).toBe(2)
+    expect(res.bodiesChanged).toBe(1)
+  })
+
+  test('running redaction twice produces byte-identical output across events, bodies, and HAR even with encoded fields present', () => {
+    const secretJson = JSON.stringify({ token: 'secret-9999' })
+    const encodedBody = Buffer.from(secretJson, 'utf-8').toString('base64')
+    s.appendEvent({
+      kind: 'network',
+      timestamp: Date.now(),
+      url: 'https://example.com/api',
+      method: 'GET',
+      status: 200,
+      responseBody: encodedBody,
+      responseBodyEncoding: 'base64',
+    })
+
+    const wsPayload = Buffer.from('secret-9999 binary-ish frame').toString('base64')
+    s.appendEvent({
+      kind: 'websocket',
+      timestamp: Date.now(),
+      url: 'wss://example.com/socket',
+      subKind: 'frame',
+      opcode: 2,
+      payloadEncoding: 'base64',
+      payload: wsPayload,
+    })
+
+    const ref = s.appendBody('req-json', Buffer.from(JSON.stringify({ ssn: 'secret-9999' })), 'application/json')!
+    writeHarToSession(s.dir, s.readEvents())
+
+    redactSessionDir(s.dir, ['secret-9999'])
+    const eventsAfterFirst = readFileSync(s.eventsPath, 'utf-8')
+    const bodyAfterFirst = readFileSync(join(s.dir, ref.path), 'utf-8')
+    const harAfterFirst = readFileSync(join(s.dir, 'session.har'), 'utf-8')
+
+    redactSessionDir(s.dir, ['secret-9999'])
+    const eventsAfterSecond = readFileSync(s.eventsPath, 'utf-8')
+    const bodyAfterSecond = readFileSync(join(s.dir, ref.path), 'utf-8')
+    const harAfterSecond = readFileSync(join(s.dir, 'session.har'), 'utf-8')
+
+    expect(eventsAfterSecond).toBe(eventsAfterFirst)
+    expect(bodyAfterSecond).toBe(bodyAfterFirst)
+    expect(harAfterSecond).toBe(harAfterFirst)
+  })
+
+  test('meta.json redaction block mirrors the returned result across the new coverage-honesty fields', () => {
+    s.appendBody('req-json', Buffer.from(JSON.stringify({ secret: 'secret-9999' })), 'application/json')
+    s.appendEvent({ kind: 'console', timestamp: 1, text: 'leaked secret-9999 here' })
+
+    const res = redactSessionDir(s.dir, ['[', 'secret-9999'])
+    expect(res.patternCount).toBe(1)
+    expect(res.patternsInvalid).toContain('[')
+    expect(res.bodiesCovered).toBe(1)
+    expect(res.bodiesChanged).toBe(1)
+
+    const meta = JSON.parse(readFileSync(s.metaPath, 'utf-8'))
+    expect(meta.redaction.patternsInvalid).toEqual(res.patternsInvalid)
+    expect(meta.redaction.bodiesCovered).toBe(res.bodiesCovered)
+    expect(meta.redaction.bodiesChanged).toBe(res.bodiesChanged)
+    expect(meta.redaction.encodedPayloadsSkipped).toEqual(res.encodedPayloadsSkipped)
+    expect(meta.redaction.encodedPayloadsCovered).toBe(res.encodedPayloadsCovered)
+    expect(meta.redaction.complete).toBe(res.complete)
+  })
+})
+
+// ─── CaptureSession.finalize() — live-path redaction accounting ────────────
+//
+// The live capture path (appendEvent + finalize) must gate `complete` with
+// the exact same honesty rules as the post-hoc redactSessionDir, and must
+// not fabricate a redaction block when no patterns were ever configured.
+
+describe('CaptureSession.finalize writes the same redaction accounting as redactSessionDir', () => {
+  test('finalize() writes a redaction block reflecting field-scoped skips, matching the honesty accounting of redactSessionDir', () => {
+    const secret = 'secret-9999'
+    const live = new CaptureSession(`live-redact-${Date.now()}-${Math.random()}`, { redact: [secret] })
+    try {
+      const wsPayload = Buffer.from(`frame carrying ${secret}`).toString('base64')
+      live.appendEvent({
+        kind: 'websocket',
+        timestamp: Date.now(),
+        url: 'wss://example.com/socket',
+        subKind: 'frame',
+        opcode: 2,
+        payloadEncoding: 'base64',
+        payload: wsPayload,
+      })
+      live.appendEvent({
+        kind: 'console',
+        timestamp: Date.now(),
+        level: 'log',
+        text: `leaked ${secret} in console`,
+      })
+      live.finalize()
+
+      const events = readEventsRaw(live.eventsPath)
+      const consoleEvent = events.find(e => e.kind === 'console')!
+      const wsEvent = events.find(e => e.kind === 'websocket')!
+
+      expect(consoleEvent.text).not.toContain(secret)
+      expect(consoleEvent.text).toContain('[REDACTED]')
+      expect(wsEvent.payload).toBe(wsPayload)
+
+      const meta = JSON.parse(readFileSync(live.metaPath, 'utf-8'))
+      expect(meta.redaction?.complete).toBe(false)
+    } finally {
+      live.cleanup()
+    }
+  })
+
+  test('finalize() writes no redaction block at all when no redact patterns were configured', () => {
+    const live = new CaptureSession(`live-noredact-${Date.now()}-${Math.random()}`, {})
+    try {
+      live.appendEvent({ kind: 'console', timestamp: 1, text: 'hello world' })
+      live.finalize()
+
+      const meta = JSON.parse(readFileSync(live.metaPath, 'utf-8'))
+      expect(meta.redaction).toBeUndefined()
+    } finally {
+      live.cleanup()
+    }
   })
 })
