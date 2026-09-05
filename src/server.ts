@@ -6,6 +6,7 @@ import {
   type WsCommand, type WsMessage, type WsCaptureEvent, type WsCaptureDone, type WsCaptureBody,
 } from './protocol.js'
 import { CaptureSession, cleanOldSessions, CAPTURES_DIR, parseCaptureConfig, type CaptureConfig, type CaptureEvent } from './capture.js'
+import { buildStartCaptureResult, startCaptureDispatchFailureMessage } from './capture-result.js'
 import { handleReplayRequest } from './replay.js'
 import { buildDashboardHtml } from './dashboard.js'
 import { FAVICON_SVG } from './favicon.js'
@@ -240,16 +241,20 @@ export class WebsterServer {
       let body: Record<string, unknown> = {}
       try { body = await req.json() as Record<string, unknown> } catch { /* empty config */ }
       const session = this.startCaptureSession(parseCaptureConfig(body))
+      let reply: Record<string, unknown> | undefined
       try {
-        await this.dispatch({
+        reply = await this.dispatch({
           action: 'startCapture',
           ...body,
           streamToServer: true,
-        }, 60000)
+        }, 60000) as Record<string, unknown>
       } catch (e) {
-        return Response.json({ error: String(e) }, { status: 500 })
+        // Don't leave an orphaned "active" session behind if the extension
+        // never confirmed the start.
+        this.stopCaptureSession()
+        return Response.json({ error: startCaptureDispatchFailureMessage(e) }, { status: 500 })
       }
-      return Response.json(session.getSnapshot())
+      return Response.json(buildStartCaptureResult(session, reply))
     }
 
     if (req.method === 'POST' && url.pathname === '/api/capture/annotate') {
