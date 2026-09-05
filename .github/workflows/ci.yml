@@ -3,8 +3,11 @@ name: CI
 on:
   push:
     branches: [main, master]
+  # Every PR, whatever it targets. Stacked PRs base on their predecessor
+  # rather than main, so a main-only filter silently skips CI on all but
+  # the bottom of a stack.
   pull_request:
-    branches: [main, master]
+    branches: ['**']
 
 jobs:
   test:
