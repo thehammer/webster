@@ -170,6 +170,24 @@ async function detachDebuggerFromTab(tabId) {
   forgetCapturedTab(tabId)
 }
 
+// Single teardown path for releasing every debugger session deep-capture is
+// holding. Used by both `stopCapture` and `startCapture`'s stop-existing-
+// capture branch so the two can't drift into different orderings again —
+// that drift (one path detaching before clearing, the other clearing first)
+// is how the stop_capture leak survived undetected for so long.
+//
+// Detach BEFORE clearing the bookkeeping: detachDebuggerFromTab guards on
+// capturedTabs.has(tabId), so clearing first makes every detach a silent
+// no-op and leaks the real CDP session (and its infobar) on every tab.
+async function detachAllCapturedTabs() {
+  const tabsToDetach = [...capturedTabs]
+  await Promise.allSettled(tabsToDetach.map(tabId => detachDebuggerFromTab(tabId)))
+  // detachDebuggerFromTab already forgets each tab; clear defensively so the
+  // collections are empty even if a tab was added by a late in-flight attach.
+  capturedTabs.clear()
+  capturedTabUrls.clear()
+}
+
 function onCaptureTabCreated(tab) {
   if (captureActive && tab.id) {
     attachDebuggerToTab(tab.id)
@@ -705,7 +723,12 @@ if (chrome.debugger?.onDetach) {
     const wasCaptured = capturedTabs.has(source.tabId)
     const url = capturedTabUrls.get(source.tabId) ?? null
     forgetCapturedTab(source.tabId)
-    if (wasCaptured) {
+    // Only a detach during a LIVE capture is a data-loss event. A detach we
+    // caused ourselves while tearing down (captureActive already false, see
+    // stopCapture) is the normal stop path, not a failure — without this
+    // guard it would warn on every clean stop once stop_capture actually
+    // detaches (see detachAllCapturedTabs).
+    if (wasCaptured && captureActive) {
       emitCaptureMeta('cdp_detached',
         `CDP detached from tab ${source.tabId} (${url}) mid-capture — request/response bodies after this point are NOT captured for this tab. Reason: ${reason || 'unknown'}`,
         { tabId: source.tabId, url, reason })
@@ -1253,9 +1276,8 @@ export async function executeCommand(command) {
           // Stop existing capture first
           stopInputDraining()
           stopDomPeriodicSnapshots()
-          for (const tabId of capturedTabs) {
-            await detachDebuggerFromTab(tabId)
-          }
+          captureActive = false
+          await detachAllCapturedTabs()
           chrome.tabs.onCreated.removeListener(onCaptureTabCreated)
           if (chrome.webNavigation) {
             chrome.webNavigation.onCompleted.removeListener(onCaptureNavigationCompleted)
@@ -1434,11 +1456,11 @@ export async function executeCommand(command) {
         // Signal server that capture is done
         pushToServer({ type: 'capture_done' })
 
-        // Detach debuggers — can now safely await since we don't return data
-        const tabsToDetach = [...capturedTabs]
-        capturedTabs.clear()
-        capturedTabUrls.clear()
-        await Promise.allSettled(tabsToDetach.map(tabId => detachDebuggerFromTab(tabId)))
+        // Detach debuggers — can now safely await since we don't return data.
+        // captureActive was already set false above, so the onDetach listener
+        // stays silent for these — they're the normal stop path, not a
+        // mid-capture failure.
+        await detachAllCapturedTabs()
 
         return { success: true, data: { stopped: true } }
       }

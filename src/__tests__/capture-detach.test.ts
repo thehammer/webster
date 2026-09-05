@@ -243,6 +243,35 @@ describe('detach when capture is not active', () => {
     expect(state.capturedTabs.has(7)).toBe(false)
     expect(state.capturedTabUrls.has(7)).toBe(false)
   })
+
+  test('detach during stop teardown is silent — captureActive flips false just before the tab detaches', () => {
+    // This is the exact scenario the stop-capture detach-ordering fix (in
+    // command-handlers.js, see stop-capture-detach.test.ts) makes reachable
+    // for the first time. Today, stopCapture clears capturedTabs BEFORE
+    // calling detachDebuggerFromTab, so detachDebuggerFromTab's own guard
+    // (`if (!capturedTabs.has(tabId)) return`) no-ops immediately —
+    // chrome.debugger.detach() is never actually called, and this onDetach
+    // listener never even fires as part of a stop. Once the ordering bug is
+    // fixed and detach() is called while the tab is still tracked, this
+    // listener WILL fire mid-teardown, right after stopCapture has already
+    // set captureActive = false. The pure contract already covers this case
+    // (via the captureActive guard above); this test names the scenario
+    // that was previously unreachable in production even though the
+    // contract already accounted for it.
+    const state = makeState({
+      captureActive: false, // stopCapture already flipped this before detaching
+      capturedTabs: new Set([7]),
+      capturedTabUrls: new Map([[7, 'https://example.com/dashboard']]),
+    })
+
+    const result = detachDecision(state, { tabId: 7 }, 'target_closed')
+
+    expect(result.emit).toBe(false)
+    expect(result.event).toBeUndefined()
+    // Cleanup still happens even though nothing was emitted.
+    expect(state.capturedTabs.has(7)).toBe(false)
+    expect(state.capturedTabUrls.has(7)).toBe(false)
+  })
 })
 
 // ─── Distinguishing cdp_detached from its attach-failure sibling cdp_unavailable ──
