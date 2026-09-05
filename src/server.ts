@@ -633,7 +633,12 @@ export class WebsterServer {
   private sweepRetention(): void {
     if (!this.retentionOptions) return
     const excludeIds = [...(this.retentionOptions.excludeIds ?? [])]
-    if (this.captureSession) excludeIds.push(this.captureSession.id)
+    // `?.active` is load-bearing: captureSession is never nulled on stop, so
+    // an unguarded read would exempt the most recently *finished* capture from
+    // retention forever — silently, since only warnings and deletions log.
+    // Note the exclusion is per-process; two servers sharing CAPTURES_DIR
+    // don't know about each other's live captures.
+    if (this.captureSession?.active) excludeIds.push(this.captureSession.id)
     cleanOldSessions({ ...this.retentionOptions, excludeIds })
   }
 

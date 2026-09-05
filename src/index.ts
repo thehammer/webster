@@ -13,7 +13,7 @@ const maxAgeMs = Number.isFinite(RETENTION_HOURS) && RETENTION_HOURS > 0
   : 0
 
 // The one production entry point — and the only place retention is turned on.
-const wsServer = new WebsterServer(PORT, undefined, { retention: { maxAgeMs } })
+const wsServer = new WebsterServer(PORT, undefined, { retention: maxAgeMs > 0 ? { maxAgeMs } : false })
 wsServer.registerSelf()
 
 const sessionManager = new McpSessionManager(wsServer)
