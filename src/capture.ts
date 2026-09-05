@@ -65,19 +65,30 @@ const MULTIPART_FORM = 'multipart/form-data'
 
 // ─── Redaction ────────────────────────────────────────────────────────────────
 
-function compilePatterns(patterns: string[] | undefined): RegExp[] {
-  if (!patterns?.length) return []
-  const out: RegExp[] = []
+/**
+ * Compile pattern source strings into case-insensitive global regexes.
+ * Non-string, empty, and malformed entries are dropped and returned in
+ * `invalid` rather than silently discarded — a caller must be able to see
+ * exactly how many (and which) patterns didn't make it into `regexes`, since
+ * `regexes.length` is what the coverage-honesty accounting keys off of.
+ */
+function compilePatterns(patterns: string[] | undefined): { regexes: RegExp[]; invalid: string[] } {
+  const regexes: RegExp[] = []
+  const invalid: string[] = []
+  if (!patterns?.length) return { regexes, invalid }
   for (const p of patterns) {
-    if (typeof p !== 'string' || !p) continue
+    if (typeof p !== 'string' || !p) {
+      invalid.push(typeof p === 'string' ? p : String(p))
+      continue
+    }
     try {
       // Every pattern is applied globally + case-insensitively by default
-      out.push(new RegExp(p, 'gi'))
+      regexes.push(new RegExp(p, 'gi'))
     } catch {
-      // Skip malformed pattern — emit nothing rather than crash the capture
+      invalid.push(p)
     }
   }
-  return out
+  return { regexes, invalid }
 }
 
 function redactString(value: string, regexes: RegExp[]): string {
@@ -105,10 +116,73 @@ function redactObject(value: unknown, regexes: RegExp[], depth = 0): unknown {
   return value
 }
 
+/**
+ * Decode `bytes` as UTF-8, but only if the decode is provably lossless:
+ * re-encoding the result must reproduce the input byte-for-byte. Returns null
+ * for anything else — invalid UTF-8, lone surrogates, replacement-character
+ * substitution. A null return means "regex cannot safely reach this data";
+ * callers must report it rather than guess.
+ */
+function decodeLosslessUtf8(bytes: Buffer): string | null {
+  const text = bytes.toString('utf-8')
+  return Buffer.compare(Buffer.from(text, 'utf-8'), bytes) === 0 ? text : null
+}
+
+// A base64 responseBody ending in this marker is a truncated prefix of
+// unknown byte alignment — trimming it to a decodable boundary would drop
+// up to three bytes, which is corruption, not redaction. Left untouched.
+const TRUNCATED_BODY_RE = /\.\.\.\[truncated, \d+ total\]$/
+
+interface EventRedactionOutcome {
+  event: CaptureEvent
+  /** Encoded payload fields decoded, redacted and re-encoded losslessly. */
+  covered: number
+  /** Descriptors of encoded fields left untouched, e.g.
+   *  'websocket.payload (base64, opcode 2)'. */
+  skipped: string[]
+}
+
+/**
+ * Redact a single capture event, aware of the encoded-payload fields that a
+ * blind `redactObject` walk cannot safely reach: base64 response bodies
+ * (network events) and base64 WebSocket frame payloads. Everything else on
+ * the event — including sibling fields alongside an encoded payload — is
+ * redacted exactly as before via `redactObject`.
+ */
+function redactCaptureEvent(event: CaptureEvent, regexes: RegExp[]): EventRedactionOutcome {
+  if (!regexes.length) return { event, covered: 0, skipped: [] }
+
+  if (event.kind === 'network' && event.responseBodyEncoding === 'base64' && typeof event.responseBody === 'string') {
+    const { responseBody, ...rest } = event
+    const redactedRest = redactObject(rest, regexes) as CaptureEvent
+
+    if (TRUNCATED_BODY_RE.test(responseBody)) {
+      return { event: { ...redactedRest, responseBody }, covered: 0, skipped: ['network.responseBody (base64, truncated)'] }
+    }
+
+    const text = decodeLosslessUtf8(Buffer.from(responseBody, 'base64'))
+    if (text === null) {
+      return { event: { ...redactedRest, responseBody }, covered: 0, skipped: ['network.responseBody (base64, not valid UTF-8)'] }
+    }
+
+    const reencoded = Buffer.from(redactString(text, regexes), 'utf-8').toString('base64')
+    return { event: { ...redactedRest, responseBody: reencoded }, covered: 1, skipped: [] }
+  }
+
+  if (event.kind === 'websocket' && event.subKind === 'frame' && event.payloadEncoding === 'base64') {
+    // CDP-declared binary (opcode 2). Never decoded: it's a length-sensitive
+    // wire format, and regex over bytes reinterpreted as text is unverifiable.
+    const { payload, ...rest } = event
+    const redactedRest = redactObject(rest, regexes) as CaptureEvent
+    return { event: { ...redactedRest, payload }, covered: 0, skipped: ['websocket.payload (base64, opcode 2)'] }
+  }
+
+  return { event: redactObject(event, regexes) as CaptureEvent, covered: 0, skipped: [] }
+}
+
 export function redactEvent(event: CaptureEvent, patterns: string[]): CaptureEvent {
-  const regexes = compilePatterns(patterns)
-  if (!regexes.length) return event
-  return redactObject(event, regexes) as CaptureEvent
+  const { regexes } = compilePatterns(patterns)
+  return redactCaptureEvent(event, regexes).event
 }
 
 // ─── Form body parsing ────────────────────────────────────────────────────────
@@ -257,11 +331,19 @@ export class CaptureSession {
   private config: CaptureConfig
   private _active = true
   private redactPatterns: string[] = []
+  private regexes: RegExp[] = []
+  private patternsInvalid: string[] = []
+  private encodedPayloadsCovered = 0
+  private encodedPayloadsSkipped = new Set<string>()
+  private encodedPayloadsSkippedCount = 0
 
   constructor(id: string, config: CaptureConfig) {
     this.id = id
     this.config = config
     this.redactPatterns = Array.isArray(config.redact) ? config.redact.filter(p => typeof p === 'string' && p.length > 0) : []
+    const compiled = compilePatterns(this.redactPatterns)
+    this.regexes = compiled.regexes
+    this.patternsInvalid = compiled.invalid
     this.startedAt = Date.now()
 
     this.dir = join(CAPTURES_DIR, id)
@@ -302,8 +384,12 @@ export class CaptureSession {
       if (parsed) final = { ...final, requestBodyParsed: parsed }
     }
 
-    if (this.redactPatterns.length) {
-      final = redactEvent(final, this.redactPatterns)
+    const outcome = redactCaptureEvent(final, this.regexes)
+    final = outcome.event
+    this.encodedPayloadsCovered += outcome.covered
+    for (const skip of outcome.skipped) {
+      this.encodedPayloadsSkipped.add(skip)
+      this.encodedPayloadsSkippedCount++
     }
 
     appendFileSync(this.eventsPath, JSON.stringify(final) + '\n')
@@ -471,11 +557,20 @@ export class CaptureSession {
 
   /**
    * Mark session as done. Updates meta.json.
+   *
+   * When redact patterns were configured, publishes a `redaction` block
+   * computed with the exact same coverage-honesty accounting as
+   * `redactSessionDir`: text bodies under bodies/ and any pre-existing
+   * session.har are covered here for the first time (event-level redaction
+   * already happened incrementally in appendEvent). When no redact patterns
+   * were configured, no `redaction` block is written at all — absence means
+   * "not redacted", which is honest; a block full of zeroes would be noise.
    */
   finalize(): CaptureSnapshot {
     this._active = false
     if (!existsSync(this.dir)) return this.getSnapshot()
-    writeFileSync(this.metaPath, JSON.stringify({
+
+    const meta: Record<string, unknown> = {
       id: this.id,
       config: this.config,
       startedAt: new Date(this.startedAt).toISOString(),
@@ -484,7 +579,44 @@ export class CaptureSession {
       eventCount: this.eventCount,
       frameCount: this.frameCount,
       breakdown: this.breakdown,
-    }, null, 2))
+    }
+
+    if (this.redactPatterns.length) {
+      const events = loadEvents(this.eventsPath)
+      const harStatus = regenerateHar(this.dir, events)
+      const { bodiesCovered, bodiesChanged, bodiesSkipped } = redactBodiesDir(this.dir, this.regexes)
+      const frameCount = countFrames(this.dir)
+      const encodedPayloadsSkipped = [...this.encodedPayloadsSkipped]
+      const { complete } = computeCompleteness({
+        bodiesSkipped,
+        encodedPayloadsSkipped,
+        frameCount,
+        harStatus,
+        patternsInvalid: this.patternsInvalid,
+        regexCount: this.regexes.length,
+      })
+
+      const redactedAt = new Date().toISOString()
+      meta.redactedAt = redactedAt
+      meta.redactPatternCount = this.regexes.length
+      meta.redaction = {
+        redactedAt,
+        eventsRedacted: this.eventCount,
+        patternCount: this.regexes.length,
+        patternsInvalid: this.patternsInvalid,
+        bodiesCovered,
+        bodiesChanged,
+        bodiesSkipped,
+        encodedPayloadsCovered: this.encodedPayloadsCovered,
+        encodedPayloadsSkipped,
+        encodedPayloadsSkippedCount: this.encodedPayloadsSkippedCount,
+        harRegenerated: harStatus === 'regenerated',
+        frameCount,
+        complete,
+      }
+    }
+
+    writeFileSync(this.metaPath, JSON.stringify(meta, null, 2))
     return this.getSnapshot()
   }
 
@@ -560,33 +692,70 @@ function isRedactableBodyExt(filename: string): boolean {
 export interface RedactionResult {
   /** Legacy field, kept for compatibility: number of events rewritten. */
   eventsRedacted: number
-  /** Number of regex patterns applied (0 means redaction was a no-op). */
+  /** Number of patterns that actually compiled. Was `patterns.length`. */
   patternCount: number
-  /** Text bodies under bodies/ that were successfully redacted in place. */
-  bodiesRedacted: number
-  /** Body filenames NOT covered — binary format, or unreadable/undecodable. */
+  /** Pattern source strings dropped as malformed, non-string, or empty. */
+  patternsInvalid: string[]
+  /** Text bodies under bodies/ examined and losslessly processed. */
+  bodiesCovered: number
+  /** Subset of bodiesCovered whose bytes actually changed. */
+  bodiesChanged: number
+  /** Body filenames NOT covered — binary extension, unreadable, or not losslessly decodable as UTF-8. */
   bodiesSkipped: string[]
+  /** Encoded event payloads (base64 response bodies) decoded, redacted and re-encoded losslessly. */
+  encodedPayloadsCovered: number
+  /** Deduped descriptors of encoded event payloads left untouched, e.g. 'websocket.payload (base64, opcode 2)'. */
+  encodedPayloadsSkipped: string[]
+  /** Total individual event fields behind encodedPayloadsSkipped (not deduped). */
+  encodedPayloadsSkippedCount: number
   /** True iff session.har existed and was regenerated from redacted events. */
   harRegenerated: boolean
   /** Number of files in frames/ — screenshots are never redactable. */
   frameCount: number
   /**
-   * True only when every location was fully covered: no binary body was
-   * skipped, no frames exist, no body file errored, and any pre-existing
-   * session.har was regenerated. False means PHI may remain in bodies/ or
-   * frames/ — callers that gate on "verified redacted" must check this
-   * flag, not merely that redaction ran.
+   * True only when NOTHING was left uncovered — see computeCompleteness.
+   * Callers gating on "safe to share" must check this flag, not merely that
+   * redaction ran.
    */
   complete: boolean
 }
 
+/**
+ * The one place `complete` is decided. `complete` may be true only when
+ * every artifact was either fully covered or provably contains nothing to
+ * redact — any new non-coverage channel must be added to `uncovered` here,
+ * never bolted on as an ad hoc boolean elsewhere.
+ */
+function computeCompleteness(parts: {
+  bodiesSkipped: string[]
+  encodedPayloadsSkipped: string[]
+  frameCount: number
+  harStatus: 'absent' | 'regenerated' | 'failed'
+  patternsInvalid: string[]
+  regexCount: number
+}): { uncovered: string[]; complete: boolean } {
+  const uncovered: string[] = [
+    ...parts.bodiesSkipped,
+    ...parts.encodedPayloadsSkipped,
+    ...(parts.frameCount > 0 ? [`frames/ (${parts.frameCount} screenshots)`] : []),
+    ...(parts.harStatus === 'failed' ? ['session.har (regeneration failed)'] : []),
+    ...(parts.patternsInvalid.length && parts.regexCount === 0 ? ['no usable patterns'] : []),
+  ]
+  return { uncovered, complete: uncovered.length === 0 }
+}
+
 /** RedactionResult for the "nothing to do" early-exit paths of redactSessionDir. */
-function emptyRedactionResult(frameCount: number): RedactionResult {
+function emptyRedactionResult(frameCount: number, patternsInvalid: string[] = []): RedactionResult {
   return {
     eventsRedacted: 0,
     patternCount: 0,
-    bodiesRedacted: 0,
+    patternsInvalid,
+    bodiesCovered: 0,
+    bodiesChanged: 0,
     bodiesSkipped: [],
+    encodedPayloadsCovered: 0,
+    encodedPayloadsSkipped: [],
+    encodedPayloadsSkippedCount: 0,
     harRegenerated: false,
     frameCount,
     complete: false,
@@ -621,14 +790,15 @@ function countFrames(dir: string): number {
 }
 
 /**
- * Redact text bodies under dir/bodies/ in place. Binary bodies (per
- * isRedactableBodyExt) are left byte-identical and reported in
- * `bodiesSkipped`, as is any file that fails to read/decode — one bad file
- * must not abort redaction of the rest of the session.
+ * Redact text bodies under dir/bodies/ in place. Binary-extension bodies
+ * (per isRedactableBodyExt) are left byte-identical and reported in
+ * `bodiesSkipped`, as is any file that fails to read, or whose bytes are not
+ * losslessly decodable as UTF-8 — one bad file must not abort redaction of
+ * the rest of the session, and must never be corrupted by a lossy decode.
  */
-function redactBodiesDir(dir: string, regexes: RegExp[]): { bodiesRedacted: number; bodiesSkipped: string[] } {
+function redactBodiesDir(dir: string, regexes: RegExp[]): { bodiesCovered: number; bodiesChanged: number; bodiesSkipped: string[] } {
   const bodiesDir = join(dir, 'bodies')
-  const result = { bodiesRedacted: 0, bodiesSkipped: [] as string[] }
+  const result = { bodiesCovered: 0, bodiesChanged: 0, bodiesSkipped: [] as string[] }
   if (!existsSync(bodiesDir)) return result
 
   let filenames: string[]
@@ -644,42 +814,60 @@ function redactBodiesDir(dir: string, regexes: RegExp[]): { bodiesRedacted: numb
       continue
     }
     const filePath = join(bodiesDir, filename)
+    let bytes: Buffer
     try {
-      const content = readFileSync(filePath, 'utf-8')
-      const redacted = redactString(content, regexes)
-      if (redacted !== content) {
-        writeFileSync(filePath, redacted)
-      }
-      result.bodiesRedacted++
+      bytes = readFileSync(filePath)
     } catch {
-      // Unreadable/undecodable file — report it, don't abort the rest.
+      // Unreadable file — report it, don't abort the rest.
       result.bodiesSkipped.push(filename)
+      continue
     }
+    const text = decodeLosslessUtf8(bytes)
+    if (text === null) {
+      // Not losslessly decodable as UTF-8 — leave it byte-identical rather
+      // than corrupt it with a lossy decode.
+      result.bodiesSkipped.push(filename)
+      continue
+    }
+    const redacted = redactString(text, regexes)
+    if (redacted !== text) {
+      writeFileSync(filePath, redacted, 'utf-8')
+      result.bodiesChanged++
+    }
+    result.bodiesCovered++
   }
   return result
 }
 
 /** Regenerate dir/session.har from `events` if (and only if) it already existed. */
-function regenerateHar(dir: string, events: CaptureEvent[]): boolean {
+function regenerateHar(dir: string, events: CaptureEvent[]): 'absent' | 'regenerated' | 'failed' {
   const harPath = join(dir, 'session.har')
-  if (!existsSync(harPath)) return false
+  if (!existsSync(harPath)) return 'absent'
   try {
     writeHarToSession(dir, events)
-    return true
+    return 'regenerated'
   } catch {
-    return false
+    return 'failed'
   }
 }
 
 /**
- * Rewrite a session directory on disk, redacting sensitive text wherever
- * regex redaction can safely reach it:
+ * Rewrite a session directory on disk, redacting sensitive text wherever it
+ * can be safely reached — including behind base64 encoding, when the decode
+ * is provably lossless:
  *
- *  - events.jsonl — every event rewritten (as before).
+ *  - events.jsonl — every event rewritten. Base64 response bodies on network
+ *                   events are decoded, redacted and re-encoded when the
+ *                   round trip is lossless; otherwise left byte-identical
+ *                   and reported. Base64 WebSocket frame payloads (binary,
+ *                   opcode 2) are NEVER decoded — a length-sensitive wire
+ *                   format that regex-over-reinterpreted-bytes can't safely
+ *                   touch — and are always reported.
  *  - bodies/      — text bodies (.json/.txt/.html/.htm/.xml/.csv/.svg) are
- *                   redacted in place; binary bodies (PDF, images, zips,
- *                   fonts, media) are left byte-identical — regex cannot
- *                   safely redact bytes — and reported in `bodiesSkipped`.
+ *                   redacted in place only when their bytes are losslessly
+ *                   decodable as UTF-8; binary-extension bodies (PDF, images,
+ *                   zips, fonts, media) and any file that fails that decode
+ *                   are left byte-identical and reported in `bodiesSkipped`.
  *  - session.har  — regenerated from the redacted events if it already
  *                   existed; never created if it didn't.
  *  - frames/      — NEVER touched. JPEG screenshots may contain PHI that no
@@ -691,14 +879,15 @@ function regenerateHar(dir: string, events: CaptureEvent[]): boolean {
  * A new `redaction` block on meta.json (and this function's return value)
  * carries the full accounting.
  *
- * `complete` is true only when nothing was left uncovered: no binary body
- * skipped, no frames present, no body errored, and any pre-existing HAR was
- * regenerated. A caller gating on "safe to share" must check `complete`, not
- * just that this function was called.
+ * `complete` is computed by computeCompleteness from a single accumulated
+ * `uncovered` list, so a future non-coverage channel can't be forgotten. A
+ * caller gating on "safe to share" must check `complete`, not just that this
+ * function was called.
  *
  * Idempotent: running this twice with the same patterns is a no-op on the
- * second pass — already-redacted text has no further matches, and the HAR is
- * regenerated from already-redacted events.
+ * second pass — already-redacted text has no further matches, encoded
+ * payloads that were covered the first time re-decode to already-redacted
+ * text, and the HAR is regenerated from already-redacted events.
  */
 export function redactSessionDir(dir: string, patterns: string[]): RedactionResult {
   const frameCount = countFrames(dir)
@@ -706,27 +895,50 @@ export function redactSessionDir(dir: string, patterns: string[]): RedactionResu
   const metaPath = join(dir, 'meta.json')
 
   if (!existsSync(eventsPath)) return emptyRedactionResult(frameCount)
-  const regexes = compilePatterns(patterns)
-  if (!regexes.length) return emptyRedactionResult(frameCount)
+  const { regexes, invalid: patternsInvalid } = compilePatterns(patterns)
+  if (!regexes.length) return emptyRedactionResult(frameCount, patternsInvalid)
 
   const events = loadEvents(eventsPath)
-  const redactedEvents = events.map(e => redactObject(e, regexes) as CaptureEvent)
+  let encodedPayloadsCovered = 0
+  const encodedPayloadsSkippedSet = new Set<string>()
+  let encodedPayloadsSkippedCount = 0
+  const redactedEvents = events.map(e => {
+    const outcome = redactCaptureEvent(e, regexes)
+    encodedPayloadsCovered += outcome.covered
+    for (const skip of outcome.skipped) {
+      encodedPayloadsSkippedSet.add(skip)
+      encodedPayloadsSkippedCount++
+    }
+    return outcome.event
+  })
   writeFileSync(eventsPath, serializeEvents(redactedEvents))
 
-  const { bodiesRedacted, bodiesSkipped } = redactBodiesDir(dir, regexes)
+  const { bodiesCovered, bodiesChanged, bodiesSkipped } = redactBodiesDir(dir, regexes)
 
-  const hadHar = existsSync(join(dir, 'session.har'))
-  const harRegenerated = hadHar ? regenerateHar(dir, redactedEvents) : false
-  const harOk = !hadHar || harRegenerated
+  const harStatus = regenerateHar(dir, redactedEvents)
+  const encodedPayloadsSkipped = [...encodedPayloadsSkippedSet]
+  const { complete } = computeCompleteness({
+    bodiesSkipped,
+    encodedPayloadsSkipped,
+    frameCount,
+    harStatus,
+    patternsInvalid,
+    regexCount: regexes.length,
+  })
 
   const result: RedactionResult = {
     eventsRedacted: redactedEvents.length,
-    patternCount: patterns.length,
-    bodiesRedacted,
+    patternCount: regexes.length,
+    patternsInvalid,
+    bodiesCovered,
+    bodiesChanged,
     bodiesSkipped,
-    harRegenerated,
+    encodedPayloadsCovered,
+    encodedPayloadsSkipped,
+    encodedPayloadsSkippedCount,
+    harRegenerated: harStatus === 'regenerated',
     frameCount,
-    complete: bodiesSkipped.length === 0 && frameCount === 0 && harOk,
+    complete,
   }
 
   writeRedactionMeta(metaPath, result)
