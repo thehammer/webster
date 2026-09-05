@@ -3,6 +3,7 @@ import type { WebsterServer } from './server.js'
 import type { VideoFormat } from './video.js'
 import type { CaptureEventKind } from './protocol.js'
 import { redactSessionDir, readSessionEvents, parseCaptureConfig, CAPTURES_DIR, type CaptureEvent } from './capture.js'
+import { buildStartCaptureResult, startCaptureDispatchFailureMessage } from './capture-result.js'
 import { writeHarToSession } from './har.js'
 import { existsSync } from 'fs'
 import { join } from 'path'
@@ -17,6 +18,26 @@ export function createTools(server: WebsterServer): WebsterTool[] {
   }
 
   const CAPTURE_TIMEOUT = 60000 // 60s — capture setup touches every tab
+  const GET_CAPTURE_PROBE_TIMEOUT = 3000 // short — a live-status probe, not full capture setup
+
+  /**
+   * Best-effort live status probe for get_capture's summary — never throws.
+   * Returns null if the extension is slow, disconnected, or replies with
+   * something unusable, so the caller can silently fall back to the
+   * disk-based snapshot.
+   */
+  async function probeExtensionStatus(timeoutMs: number): Promise<Record<string, unknown> | null> {
+    try {
+      const reply = await dispatch('getCapture', {}, timeoutMs) as Record<string, unknown>
+      return {
+        tabsAttached: typeof reply?.tabsAttached === 'number' ? reply.tabsAttached : null,
+        pendingRequests: typeof reply?.pendingRequests === 'number' ? reply.pendingRequests : null,
+        active: typeof reply?.active === 'boolean' ? reply.active : null,
+      }
+    } catch {
+      return null
+    }
+  }
 
   return [
     {
@@ -432,7 +453,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'start_capture',
-      description: 'Start deep capture using Chrome Debugger Protocol. Captures network requests/responses (full headers + bodies), WebSocket frames (opcode, direction, payload), console output, JS errors, user input, and optionally DOM / storage / screenshot frames. Capture data streams to the server in real time — resilient to extension restarts. Use stop_capture to finish, get_capture to read. NOTE: Safari uses webRequest (no bodies, no WS frames) — use Chrome or Edge for full fidelity.',
+      description: 'Start deep capture using Chrome Debugger Protocol. Captures network requests/responses (full headers + bodies), WebSocket frames (opcode, direction, payload), console output, JS errors, user input, and optionally DOM / storage / screenshot frames. Capture data streams to the server in real time — resilient to extension restarts. Use stop_capture to finish, get_capture to read. NOTE: Safari uses webRequest (no bodies, no WS frames) — use Chrome or Edge for full fidelity. Returns `tabsAttached` — the number of tabs CDP actually attached to — and `warnings`. ALWAYS check these: `tabsAttached: 0` means the capture will record NO request/response bodies (the most common cause is a chrome-extension:// iframe, e.g. a password manager, that makes Chrome refuse chrome.debugger.attach) — close the offending tab/extension and restart the capture rather than proceeding on a capture that is silently recording nothing.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -462,13 +483,22 @@ export function createTools(server: WebsterServer): WebsterTool[] {
         const session = server.startCaptureSession(parseCaptureConfig(input))
 
         // Tell extension to start capture + streaming
-        await dispatch('startCapture', {
-          ...input,
-          // Signal to extension: stream events to server instead of buffering
-          streamToServer: true,
-        }, CAPTURE_TIMEOUT)
+        let reply: Record<string, unknown> | undefined
+        try {
+          reply = await dispatch('startCapture', {
+            ...input,
+            // Signal to extension: stream events to server instead of buffering
+            streamToServer: true,
+          }, CAPTURE_TIMEOUT) as Record<string, unknown>
+        } catch (e) {
+          // Don't leave an orphaned "active" session behind if the extension
+          // never confirmed the start — it would otherwise show up in
+          // /api/sessions as "abandoned" with no indication why.
+          server.stopCaptureSession()
+          throw new Error(startCaptureDispatchFailureMessage(e))
+        }
 
-        return session.getSnapshot()
+        return buildStartCaptureResult(session, reply)
       },
     },
 
@@ -492,7 +522,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'get_capture',
-      description: 'Read capture data from the server. Returns a summary by default. Use parameters to drill into specific events, filter by URL/kind/method, or full-text search. Data is read from disk — no round-trip to the browser extension.',
+      description: 'Read capture data from the server. Returns a summary by default. Use parameters to drill into specific events, filter by URL/kind/method, or full-text search. Summary data is read from disk; when the session is still active and the extension is connected, the summary also includes a live `extension` status field (tabsAttached, pendingRequests) from a quick round-trip to the browser extension — this is best-effort and silently omitted if the extension is disconnected or slow to respond.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -533,8 +563,13 @@ export function createTools(server: WebsterServer): WebsterTool[] {
           })
         }
 
-        // Default: summary only
-        return session.getSnapshot()
+        // Default: summary, best-effort enriched with live extension status
+        const snapshot = session.getSnapshot()
+        if (session.active && server.isConnected()) {
+          const extension = await probeExtensionStatus(GET_CAPTURE_PROBE_TIMEOUT)
+          if (extension) return { ...snapshot, extension }
+        }
+        return snapshot
       },
     },
 
