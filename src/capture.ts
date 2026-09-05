@@ -1121,7 +1121,20 @@ export function cleanOldSessions(options: RetentionOptions = {}): RetentionRepor
       continue
     }
 
-    if (ageMs <= maxAgeMs) continue
+    // Under the age limit. If a previous cycle left an eviction notice on it,
+    // clear it: something touched the session since (export_har creating
+    // session.har bumps the directory mtime), so it is no longer the session
+    // that was warned. Leaving a stale stamp would let the next sweep that
+    // finds it over-age delete it immediately against an expiry from the
+    // previous cycle — a deletion with no notice in its own cycle.
+    if (ageMs <= maxAgeMs) {
+      if (meta.retentionExpiresAt !== undefined || meta.retentionWarnedAt !== undefined) {
+        delete meta.retentionExpiresAt
+        delete meta.retentionWarnedAt
+        writeSessionMeta(sessionDir, meta)
+      }
+      continue
+    }
 
     const stamp = meta.retentionExpiresAt
     const expiresAt = typeof stamp === 'string' ? Date.parse(stamp) : NaN
