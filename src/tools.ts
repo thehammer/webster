@@ -629,7 +629,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'redact_capture',
-      description: 'Apply redaction patterns to an existing capture on disk. Rewrites events.jsonl in place, replacing every regex match (case-insensitive, global) with [REDACTED]. Targets URL, headers, bodies, payloads, and DOM HTML — anywhere text appears. Use this AFTER the fact when you forgot to pass redact: to start_capture, or when sharing a session externally.',
+      description: 'Apply redaction patterns to an existing capture on disk, replacing every regex match (case-insensitive, global) with [REDACTED]. Text response bodies are redacted inline in events.jsonl, which is where the pipeline actually stores them. Base64-encoded response bodies are decoded, redacted and re-encoded when the decode is provably lossless (round-trips byte-for-byte); otherwise they are left untouched and reported. Binary WebSocket frames (opcode 2) are NEVER redacted — decoding a declared-binary wire format to apply regex would be unverifiable and risks corrupting frame length — they are always left untouched and reported. bodies/ in practice holds binary response bodies; they are left byte-identical and reported by filename. frames/ screenshots are never redacted and are reported by count. session.har is regenerated only if one already existed. Check the returned `complete` flag before treating a session as safe to share — `false` means something was left uncovered. Use this AFTER the fact when you forgot to pass redact: to start_capture, or when sharing a session externally.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -661,7 +661,36 @@ export function createTools(server: WebsterServer): WebsterTool[] {
           dir = session.dir
         }
         const result = redactSessionDir(dir, patterns)
-        return { sessionId: resolvedId, ...result }
+
+        // The total no-op case must not look like a success: every pattern
+        // supplied was malformed, so nothing was rewritten anywhere.
+        // (patterns.length > 0 is already guaranteed by the check above.)
+        if (result.patternCount === 0) {
+          return {
+            sessionId: resolvedId,
+            warning: `Redaction did NOT run: all ${patterns.length} pattern(s) were malformed and dropped: ${result.patternsInvalid.join(', ')}`,
+            ...result,
+          }
+        }
+
+        const notCovered: string[] = []
+        if (result.bodiesSkipped.length) {
+          notCovered.push(`${result.bodiesSkipped.length} binary/unreadable body file(s) not redacted: ${result.bodiesSkipped.join(', ')}`)
+        }
+        if (result.encodedPayloadsSkippedCount > 0) {
+          notCovered.push(`${result.encodedPayloadsSkippedCount} encoded event payload(s) not redacted: ${result.encodedPayloadsSkipped.join(', ')}`)
+        }
+        if (result.frameCount > 0) {
+          notCovered.push(`${result.frameCount} screenshot frame(s) not redacted — frames/ cannot be redacted`)
+        }
+        if (result.patternsInvalid.length) {
+          notCovered.push(`${result.patternsInvalid.length} pattern(s) malformed and dropped: ${result.patternsInvalid.join(', ')}`)
+        }
+        return {
+          sessionId: resolvedId,
+          ...(notCovered.length ? { warning: `Redaction incomplete: ${notCovered.join('; ')}` } : {}),
+          ...result,
+        }
       },
     },
 
