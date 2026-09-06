@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { existsSync, readFileSync, readdirSync, mkdirSync } from 'fs'
+import { existsSync, readFileSync, readdirSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { join } from 'path'
+import { tmpdir } from 'os'
 import { CaptureSession, cleanOldSessions, redactSessionDir, type CaptureEvent } from '../capture.js'
 import { writeHarToSession } from '../har.js'
 
@@ -187,9 +188,186 @@ describe('CaptureSession', () => {
   })
 })
 
+// ─── cleanOldSessions (retention sweep) ────────────────────────────────────
+//
+// SAFETY: every test in this block passes an explicit `dir` under tmpdir.
+// cleanOldSessions() with no args (or no `dir`) targets the real, PHI-bearing
+// ~/.webster/captures directory — never call it that way here.
+
 describe('cleanOldSessions', () => {
-  test('does not throw when captures directory does not exist', () => {
-    expect(() => cleanOldSessions()).not.toThrow()
+  let root: string
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'webster-retention-'))
+  })
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  /** Creates root/id/meta.json (and the directory) with the given meta contents. */
+  function makeSession(dirRoot: string, id: string, meta: Record<string, unknown> = {}): string {
+    const dir = join(dirRoot, id)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify({
+      id,
+      config: {},
+      startedAt: new Date().toISOString(),
+      status: 'finished',
+      ...meta,
+    }, null, 2))
+    return dir
+  }
+
+  test('does not throw and returns an empty report when the captures directory does not exist', () => {
+    const missing = join(tmpdir(), 'webster-does-not-exist-xyz')
+    let report: ReturnType<typeof cleanOldSessions> | undefined
+    expect(() => { report = cleanOldSessions({ dir: missing }) }).not.toThrow()
+    expect(report).toEqual({ warned: [], deleted: [], pending: [], skipped: [] })
+  })
+
+  test('a fresh session is left untouched and absent from every report bucket', () => {
+    const dir = makeSession(root, 'fresh-session')
+
+    const report = cleanOldSessions({ dir: root, now: Date.now() })
+
+    expect(existsSync(dir)).toBe(true)
+    expect(report.warned).not.toContain('fresh-session')
+    expect(report.deleted).not.toContain('fresh-session')
+    expect(report.pending).not.toContain('fresh-session')
+  })
+
+  test('an over-age session survives its FIRST sweep, gets warned, and is stamped with retentionExpiresAt', () => {
+    // This is the load-bearing test: the first run of the retention sweep on
+    // any machine (including one with old real sessions) must delete NOTHING.
+    const dir = makeSession(root, 'over-age-session')
+    const future = Date.now() + 100 * 3600_000 // far enough ahead that mtime looks stale
+
+    const report = cleanOldSessions({ dir: root, now: future })
+
+    expect(existsSync(dir)).toBe(true)
+    expect(report.warned).toContain('over-age-session')
+    expect(report.deleted).not.toContain('over-age-session')
+
+    const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf-8'))
+    expect(meta.retentionExpiresAt).toBeDefined()
+  })
+
+  test('a warned session is deleted once the grace period has elapsed', () => {
+    const dir = makeSession(root, 'grace-elapsed-session')
+    const firstSweep = Date.now() + 100 * 3600_000
+    const graceMs = 24 * 3600_000
+
+    const first = cleanOldSessions({ dir: root, now: firstSweep, graceMs })
+    expect(first.warned).toContain('grace-elapsed-session')
+
+    const afterGrace = firstSweep + graceMs + 1000
+    const second = cleanOldSessions({ dir: root, now: afterGrace, graceMs })
+
+    expect(second.deleted).toContain('grace-elapsed-session')
+    expect(existsSync(dir)).toBe(false)
+  })
+
+  test('a warned session still within its grace period is reported pending and left on disk', () => {
+    const dir = makeSession(root, 'grace-pending-session')
+    const firstSweep = Date.now() + 100 * 3600_000
+    const graceMs = 24 * 3600_000
+
+    const first = cleanOldSessions({ dir: root, now: firstSweep, graceMs })
+    expect(first.warned).toContain('grace-pending-session')
+
+    const stillInGrace = firstSweep + 1000 // well before firstSweep + graceMs
+    const second = cleanOldSessions({ dir: root, now: stillInGrace, graceMs })
+
+    expect(second.pending).toContain('grace-pending-session')
+    expect(second.deleted).not.toContain('grace-pending-session')
+    expect(existsSync(dir)).toBe(true)
+  })
+
+  test('an excluded session id is never warned or deleted, and its meta is left unstamped', () => {
+    const dir = makeSession(root, 'excluded-session')
+    const future = Date.now() + 100 * 3600_000
+
+    const report = cleanOldSessions({ dir: root, now: future, excludeIds: ['excluded-session'] })
+
+    expect(report.warned).not.toContain('excluded-session')
+    expect(report.deleted).not.toContain('excluded-session')
+    expect(report.skipped).toContain('excluded-session')
+    expect(existsSync(dir)).toBe(true)
+
+    const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf-8'))
+    expect(meta.retentionExpiresAt).toBeUndefined()
+  })
+
+  test('a directory with no meta.json is skipped and never deleted', () => {
+    const dir = join(root, 'not-a-session')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'some-other-file.txt'), 'not a webster session')
+    const future = Date.now() + 100 * 3600_000
+
+    const report = cleanOldSessions({ dir: root, now: future })
+
+    expect(report.skipped).toContain('not-a-session')
+    expect(report.warned).not.toContain('not-a-session')
+    expect(report.deleted).not.toContain('not-a-session')
+    expect(existsSync(dir)).toBe(true)
+  })
+
+  test('a session with corrupt meta.json is skipped, left on disk, and does not throw', () => {
+    const dir = join(root, 'corrupt-session')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'meta.json'), '{ this is not valid json')
+    const future = Date.now() + 100 * 3600_000
+
+    let report: ReturnType<typeof cleanOldSessions> | undefined
+    expect(() => { report = cleanOldSessions({ dir: root, now: future }) }).not.toThrow()
+
+    expect(report!.skipped).toContain('corrupt-session')
+    expect(report!.deleted).not.toContain('corrupt-session')
+    expect(existsSync(dir)).toBe(true)
+  })
+
+  test('stamping retentionExpiresAt preserves all other meta.json keys, including the redaction block', () => {
+    const redaction = {
+      redactedAt: new Date().toISOString(),
+      patternCount: 2,
+      bodiesRedacted: 1,
+      bodiesSkipped: [] as string[],
+      harRegenerated: true,
+      frameCount: 0,
+      complete: true,
+    }
+    const dir = makeSession(root, 'redacted-session', {
+      redaction,
+      redactedAt: redaction.redactedAt,
+      redactPatternCount: 2,
+    })
+    const future = Date.now() + 100 * 3600_000
+
+    const report = cleanOldSessions({ dir: root, now: future })
+    expect(report.warned).toContain('redacted-session')
+
+    const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf-8'))
+    expect(meta.redaction).toEqual(redaction)
+    expect(meta.redactedAt).toBe(redaction.redactedAt)
+    expect(meta.redactPatternCount).toBe(2)
+    expect(meta.id).toBe('redacted-session')
+    expect(meta.status).toBe('finished')
+    expect(meta.retentionExpiresAt).toBeDefined()
+  })
+
+  test('maxAgeMs: 0 disables deletion entirely — a very old session is neither warned nor deleted', () => {
+    const dir = makeSession(root, 'retain-forever-session')
+    const farFuture = Date.now() + 365 * 24 * 3600_000 // a year "later"
+
+    const report = cleanOldSessions({ dir: root, now: farFuture, maxAgeMs: 0 })
+
+    expect(report.warned).not.toContain('retain-forever-session')
+    expect(report.deleted).not.toContain('retain-forever-session')
+    expect(existsSync(dir)).toBe(true)
+
+    const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf-8'))
+    expect(meta.retentionExpiresAt).toBeUndefined()
   })
 })
 

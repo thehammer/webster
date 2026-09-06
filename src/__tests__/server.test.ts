@@ -1,4 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync } from 'fs'
+import { join } from 'path'
+import { tmpdir } from 'os'
 import { WebsterServer } from '../server.js'
 
 function findFreePort(): Promise<number> {
@@ -281,5 +284,174 @@ describe('POST /api/capture/start', () => {
     server.getCaptureSession()?.cleanup()
     ws.close()
     server.close()
+  })
+})
+
+// ─── Retention (startup sweep) ──────────────────────────────────────────────
+//
+// SAFETY: neither test below ever points retention at the real CAPTURES_DIR.
+// The first constructs a server with the retention default (must be
+// disabled — this suite constructs ~14 servers via `new WebsterServer(port, ...)`
+// with no retention option, and none of those may sweep real data). The
+// second explicitly redirects retention at a temp directory.
+//
+// Implementation hook assumed: WebsterServer exposes a public boolean
+// `retentionEnabled` reflecting whether a retention sweep/timer is active —
+// true only when constructed with a truthy `retention` option, and flipped
+// back to false once `close()` has cleared the interval. Cody: wire this up,
+// or swap in whatever equivalent observable you land on and adjust the
+// assertions below.
+
+describe('WebsterServer retention', () => {
+  test('a default-constructed server has retention disabled and never sweeps', async () => {
+    const port = await findFreePort()
+    const dir = mkdtempSync(join(tmpdir(), 'webster-retention-server-'))
+    const sessionDir = join(dir, 'ancient-session')
+    mkdirSync(sessionDir, { recursive: true })
+    writeFileSync(join(sessionDir, 'meta.json'), JSON.stringify({
+      id: 'ancient-session',
+      config: {},
+      startedAt: new Date(0).toISOString(),
+      status: 'finished',
+    }))
+    const ancientTime = new Date(Date.now() - 365 * 24 * 3600_000)
+    utimesSync(sessionDir, ancientTime, ancientTime)
+
+    const server = new WebsterServer(port, 500) // no retention option — the default every other test in this suite relies on
+
+    expect(server.retentionEnabled).toBe(false)
+    // This directory was never handed to the server, so it must survive
+    // regardless — but if a bug ever made the default fall back to sweeping
+    // "whatever dir it can find," this guards against that too.
+    expect(existsSync(sessionDir)).toBe(true)
+
+    server.close()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('a server constructed with an explicit retention dir runs a startup sweep that warns (not deletes) an over-age session, and close() clears the interval', async () => {
+    const port = await findFreePort()
+    const dir = mkdtempSync(join(tmpdir(), 'webster-retention-server-'))
+    const sessionDir = join(dir, 'over-age-session')
+    mkdirSync(sessionDir, { recursive: true })
+    writeFileSync(join(sessionDir, 'meta.json'), JSON.stringify({
+      id: 'over-age-session',
+      config: {},
+      startedAt: new Date(0).toISOString(),
+      status: 'finished',
+    }))
+    const ancientTime = new Date(Date.now() - 365 * 24 * 3600_000)
+    utimesSync(sessionDir, ancientTime, ancientTime)
+
+    const server = new WebsterServer(port, 500, { retention: { dir } })
+
+    expect(server.retentionEnabled).toBe(true)
+    // First sweep ever on this session: warned, not deleted.
+    expect(existsSync(sessionDir)).toBe(true)
+    const meta = JSON.parse(readFileSync(join(sessionDir, 'meta.json'), 'utf-8'))
+    expect(meta.retentionExpiresAt).toBeDefined()
+
+    server.close()
+    expect(server.retentionEnabled).toBe(false)
+
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  // Regression for the bug where `this.captureSession` is only ever set, never
+  // cleared, on stop. Every other liveness check in server.ts guards with
+  // `this.captureSession?.active` (see lines 240, 299, 568, 589, 678) — the
+  // exclusion in sweepRetention() didn't, so the most recently *finished*
+  // capture stayed in excludeIds forever and was permanently exempt from
+  // retention. This test drives a real start -> stop through the server's
+  // public surface (startCaptureSession / stopCaptureSession — both public,
+  // used the same way by the "capture push events" tests above) so
+  // `captureSession` ends up non-null and finalized, then forces a sweep and
+  // asserts the finished session is warned, not silently exempted forever.
+  test('a capture session that was started and then stopped is not exempt from the retention sweep', async () => {
+    const port = await findFreePort()
+    const dir = mkdtempSync(join(tmpdir(), 'webster-retention-server-'))
+    const server = new WebsterServer(port, 500, { retention: { dir } })
+    const session = server.startCaptureSession({})
+
+    // Cleanup lives in `finally` so a failing assertion below (the whole
+    // point of this test, against the current bug) can never leak the real
+    // CaptureSession directory this test created under ~/.webster/captures/,
+    // nor the temp retention dir.
+    try {
+      server.stopCaptureSession()
+      expect(session.active).toBe(false)
+
+      // The real CaptureSession persists under the real CAPTURES_DIR, not this
+      // temp retention dir. To isolate the excludeIds computation from where
+      // CaptureSession actually writes, plant a *separate* over-age session
+      // directory in the temp dir whose id equals the stopped session's id —
+      // that's the only thing sweepRetention's exclusion logic looks at.
+      const sessionDir = join(dir, session.id)
+      mkdirSync(sessionDir, { recursive: true })
+      writeFileSync(join(sessionDir, 'meta.json'), JSON.stringify({
+        id: session.id,
+        config: {},
+        startedAt: new Date(0).toISOString(),
+        status: 'finished',
+      }))
+      const ancientTime = new Date(Date.now() - 365 * 24 * 3600_000)
+      utimesSync(sessionDir, ancientTime, ancientTime)
+
+      // The constructor's startup sweep already ran before this session
+      // existed, so force a second sweep now. sweepRetention() is private;
+      // casting to invoke it directly avoids waiting for the hourly interval.
+      ;(server as unknown as { sweepRetention(): void }).sweepRetention()
+
+      // A finished capture must NOT be permanently exempt from retention: this
+      // over-age directory should be warned (retentionExpiresAt stamped), not
+      // skipped just because its id matches the server's last-known
+      // captureSession.id.
+      expect(existsSync(sessionDir)).toBe(true)
+      const meta = JSON.parse(readFileSync(join(sessionDir, 'meta.json'), 'utf-8'))
+      expect(meta.retentionExpiresAt).toBeDefined()
+    } finally {
+      server.close()
+      session.cleanup() // remove the real CaptureSession directory this test created under ~/.webster/captures/
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // Complementary case: the guard must not regress in the other direction —
+  // while a capture is still active, its id must remain excluded from the
+  // sweep so retention never deletes out from under a live, appending
+  // session.
+  test('an active capture session IS excluded from the retention sweep', async () => {
+    const port = await findFreePort()
+    const dir = mkdtempSync(join(tmpdir(), 'webster-retention-server-'))
+    const server = new WebsterServer(port, 500, { retention: { dir } })
+
+    const session = server.startCaptureSession({})
+
+    try {
+      expect(session.active).toBe(true)
+
+      const sessionDir = join(dir, session.id)
+      mkdirSync(sessionDir, { recursive: true })
+      writeFileSync(join(sessionDir, 'meta.json'), JSON.stringify({
+        id: session.id,
+        config: {},
+        startedAt: new Date(0).toISOString(),
+        status: 'active',
+      }))
+      const ancientTime = new Date(Date.now() - 365 * 24 * 3600_000)
+      utimesSync(sessionDir, ancientTime, ancientTime)
+
+      ;(server as unknown as { sweepRetention(): void }).sweepRetention()
+
+      // Still active — must be excluded (skipped), not warned.
+      expect(existsSync(sessionDir)).toBe(true)
+      const meta = JSON.parse(readFileSync(join(sessionDir, 'meta.json'), 'utf-8'))
+      expect(meta.retentionExpiresAt).toBeUndefined()
+    } finally {
+      server.stopCaptureSession()
+      server.close()
+      session.cleanup() // remove the real CaptureSession directory this test created under ~/.webster/captures/
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
