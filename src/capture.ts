@@ -703,6 +703,30 @@ export interface RedactionResult {
    * redaction ran.
    */
   complete: boolean
+  /**
+   * Every reason `complete` is false, one entry per uncovered channel. See
+   * computeCompleteness: this is the single accumulated list `complete` is
+   * derived from there, exposed so a caller can tell *what* wasn't covered,
+   * not just that something wasn't. In that normal path `complete` is
+   * exactly `uncovered.length === 0`. The one exception is the early-exit
+   * results built by emptyRedactionResult: those force `complete: false`
+   * even when `uncovered` comes back empty, because an empty list there
+   * means nothing was attempted (no events file, or no pattern compiled) —
+   * not that everything was covered.
+   */
+  uncovered: string[]
+}
+
+/**
+ * Describe dropped (malformed) patterns for `uncovered`, naming them so a
+ * caller can tell "1 of 5 was malformed" from "none compiled" — one entry
+ * whenever ANY supplied pattern failed to compile, not only when all of them
+ * did (a single valid pattern still leaves the content behind every
+ * malformed one unredacted).
+ */
+function describeInvalidPatterns(patternsInvalid: string[]): string[] {
+  if (!patternsInvalid.length) return []
+  return [`${patternsInvalid.length} pattern(s) failed to compile: ${patternsInvalid.join(', ')}`]
 }
 
 /**
@@ -717,19 +741,24 @@ function computeCompleteness(parts: {
   frameCount: number
   harStatus: 'absent' | 'regenerated' | 'failed'
   patternsInvalid: string[]
-  regexCount: number
 }): { uncovered: string[]; complete: boolean } {
   const uncovered: string[] = [
     ...parts.bodiesSkipped,
     ...parts.encodedPayloadsSkipped,
     ...(parts.frameCount > 0 ? [`frames/ (${parts.frameCount} screenshots)`] : []),
     ...(parts.harStatus === 'failed' ? ['session.har (regeneration failed)'] : []),
-    ...(parts.patternsInvalid.length && parts.regexCount === 0 ? ['no usable patterns'] : []),
+    ...describeInvalidPatterns(parts.patternsInvalid),
   ]
   return { uncovered, complete: uncovered.length === 0 }
 }
 
-/** RedactionResult for the "nothing to do" early-exit paths of redactSessionDir. */
+/**
+ * RedactionResult for the "nothing to do" early-exit paths of
+ * redactSessionDir (no events file, or no pattern compiled). Always
+ * `complete: false` regardless of `uncovered` — see the doc comment on
+ * `RedactionResult.uncovered` — since nothing was actually attempted here,
+ * so an empty `uncovered` would otherwise misleadingly read as "covered."
+ */
 function emptyRedactionResult(frameCount: number, patternsInvalid: string[] = []): RedactionResult {
   return {
     eventsRedacted: 0,
@@ -743,6 +772,7 @@ function emptyRedactionResult(frameCount: number, patternsInvalid: string[] = []
     encodedPayloadsSkippedCount: 0,
     harRegenerated: false,
     frameCount,
+    uncovered: describeInvalidPatterns(patternsInvalid),
     complete: false,
   }
 }
@@ -772,13 +802,12 @@ function finishRedaction(
 ): Omit<RedactionResult, 'eventsRedacted' | 'patternCount'> {
   const { bodiesCovered, bodiesChanged, bodiesSkipped } = redactBodiesDir(dir, regexes)
   const harStatus = regenerateHar(dir, events)
-  const { complete } = computeCompleteness({
+  const { uncovered, complete } = computeCompleteness({
     bodiesSkipped,
     encodedPayloadsSkipped: encodedPayloads.skipped,
     frameCount,
     harStatus,
     patternsInvalid,
-    regexCount: regexes.length,
   })
 
   return {
@@ -791,6 +820,7 @@ function finishRedaction(
     encodedPayloadsSkippedCount: encodedPayloads.skippedCount,
     harRegenerated: harStatus === 'regenerated',
     frameCount,
+    uncovered,
     complete,
   }
 }

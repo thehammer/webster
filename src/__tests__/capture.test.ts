@@ -877,6 +877,25 @@ describe('redactSessionDir — encoded payload coverage honesty', () => {
     expect(res.patternCount).toBe(1)
     expect(res.patternsInvalid).toContain('[')
 
+    // A dropped pattern means content it was meant to cover was never touched,
+    // so the run is not complete — and the pattern that was dropped must be named.
+    expect(res.complete).toBe(false)
+    expect(res.uncovered.some(u => u.includes('['))).toBe(true)
+
+    const [ev] = readEventsRaw(s.eventsPath)
+    expect(ev.text).not.toContain('secret-9999')
+    expect(ev.text).toContain('[REDACTED]')
+  })
+
+  test('when every pattern compiles, complete is true and uncovered is empty', () => {
+    s.appendEvent({ kind: 'console', timestamp: 1, text: 'leaked secret-9999 here' })
+
+    const res = redactSessionDir(s.dir, ['secret-9999', 'another-\\d+'])
+    expect(res.patternCount).toBe(2)
+    expect(res.patternsInvalid).toEqual([])
+    expect(res.complete).toBe(true)
+    expect(res.uncovered).toEqual([])
+
     const [ev] = readEventsRaw(s.eventsPath)
     expect(ev.text).not.toContain('secret-9999')
     expect(ev.text).toContain('[REDACTED]')
@@ -891,6 +910,7 @@ describe('redactSessionDir — encoded payload coverage honesty', () => {
     expect(res.patternsInvalid).toContain('[')
     expect(res.patternsInvalid).toContain('(')
     expect(res.complete).toBe(false)
+    expect(res.uncovered.length).toBeGreaterThan(0)
 
     const after = readFileSync(s.eventsPath, 'utf-8')
     expect(after).toBe(before)
@@ -963,6 +983,8 @@ describe('redactSessionDir — encoded payload coverage honesty', () => {
     expect(res.patternsInvalid).toContain('[')
     expect(res.bodiesCovered).toBe(1)
     expect(res.bodiesChanged).toBe(1)
+    // Mixed valid/invalid patterns: the run cannot honestly claim completeness.
+    expect(res.complete).toBe(false)
 
     const meta = JSON.parse(readFileSync(s.metaPath, 'utf-8'))
     expect(meta.redaction.patternsInvalid).toEqual(res.patternsInvalid)
