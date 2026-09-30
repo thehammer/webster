@@ -216,6 +216,8 @@ function decodePostDataEntries(entries) {
   const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0))
   let off = 0
   for (const c of chunks) { all.set(c, off); off += c.length }
+  // requestBody is a string, so this is lossy for non-UTF-8 payloads (multipart
+  // file uploads, protobuf): invalid sequences become U+FFFD rather than throwing.
   return new TextDecoder().decode(all)
 }
 
