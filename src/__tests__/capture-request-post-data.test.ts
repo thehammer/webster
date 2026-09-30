@@ -5,7 +5,7 @@
  *
  * Drives the real handleDebuggerEvent via start_capture with a stubbed chrome.
  */
-import { describe, test, expect, mock, beforeEach } from 'bun:test'
+import { describe, test, expect, mock, beforeEach, afterAll } from 'bun:test'
 import { resolve } from 'node:path'
 
 const pushed: any[] = []
@@ -19,6 +19,15 @@ let onEvent: ((source: any, method: string, params: any) => void) | null = null
 let postDataImpl: (debuggee: any, params: any) => Promise<any> = async () => ({})
 
 const noopEvent = { addListener() {}, removeListener() {} }
+// Bun runs every test file in one process, so restore the global we replace.
+// (mock.module above can't be undone, but it only targets the service-worker
+// module, which no other test file imports.)
+const hadChrome = 'chrome' in globalThis
+const previousChrome = (globalThis as any).chrome
+afterAll(() => {
+  if (hadChrome) (globalThis as any).chrome = previousChrome
+  else delete (globalThis as any).chrome
+})
 ;(globalThis as any).chrome = {
   runtime: { lastError: undefined, sendMessage: async () => {} },
   tabs: { query: async () => [], get: async () => ({}), sendMessage: async () => {}, onCreated: noopEvent, onRemoved: noopEvent, onUpdated: noopEvent },
@@ -89,6 +98,15 @@ describe('capture request bodies for POSTs', () => {
     })
     expect(ev.requestBody).toBe('{"name":"Zoë","n":2}')
     expect(postCalls()).toHaveLength(0)
+  })
+
+  test('decodes non-UTF-8 postDataEntries lossily (U+FFFD) instead of dropping the event', async () => {
+    const ev = await capturePost({
+      hasPostData: true,
+      postDataEntries: [{ bytes: Buffer.from([0x61, 0xff, 0x62]).toString('base64') }],
+    })
+    expect(ev.requestBody).toBe('a\uFFFDb')
+    expect(ev.status).toBe(200)
   })
 
   test('falls back to Network.getRequestPostData when hasPostData is set without postData or entries', async () => {
