@@ -2,7 +2,11 @@
 # Install Webster as a Claude Code agent.
 #
 # What this does:
-#   1. Registers the Webster MCP server in ~/.claude.json
+#   1. Registers the Webster MCP server in ~/.claude.json as an HTTP server
+#      (http://localhost:$WEBSTER_PORT/mcp, default 3456). The server itself runs
+#      separately (launchd / `bun start`); Claude Code only connects to it.
+#      Do NOT register it as a stdio command — Claude Code would spawn a second
+#      server that can't bind the port and exits, leaving the MCP "Connection closed".
 #   2. Copies the agent definition to ~/.claude/agents/webster.md
 #
 # The MCP server is registered globally so the agent can use it from any
@@ -11,7 +15,7 @@
 # is invoked.
 #
 # Usage:
-#   ./scripts/install.sh              # install using 'bun' to run the server
+#   ./scripts/install.sh              # register the HTTP MCP server + agent
 #   ./scripts/install.sh --check      # verify installation
 #   ./scripts/install.sh --uninstall  # remove webster from Claude config
 set -euo pipefail
@@ -22,6 +26,7 @@ CLAUDE_CONFIG="$HOME/.claude.json"
 AGENTS_DIR="$HOME/.claude/agents"
 AGENT_SRC="$WEBSTER_DIR/.claude/agents/webster.md"
 AGENT_DEST="$AGENTS_DIR/webster.md"
+WEBSTER_PORT="${WEBSTER_PORT:-3456}"
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -118,7 +123,6 @@ do_install() {
 import json, os
 
 config_path = '$CLAUDE_CONFIG'
-webster_dir = '$WEBSTER_DIR'
 
 # Load existing config or start fresh
 if os.path.exists(config_path):
@@ -130,16 +134,15 @@ else:
 servers = cfg.setdefault('mcpServers', {})
 
 servers['webster'] = {
-    'command': 'bun',
-    'args': [webster_dir + '/src/index.ts'],
-    'env': {}
+    'type': 'http',
+    'url': 'http://localhost:$WEBSTER_PORT/mcp'
 }
 
 with open(config_path, 'w') as f:
     json.dump(cfg, f, indent=2)
 
 print("  ✓ Registered MCP server in ~/.claude.json")
-print("    Command: bun " + webster_dir + "/src/index.ts")
+print("    URL: http://localhost:$WEBSTER_PORT/mcp (start the server separately: bun start)")
 PYEOF
 
   # 2. Install agent definition
