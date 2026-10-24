@@ -29,7 +29,7 @@ Claude Code (HTTP MCP)
 ## Key Commands
 
 ```bash
-bun test                              # run tests (404 tests)
+bun test                              # run tests
 bun run typecheck                     # type check
 bun start                             # start MCP server manually
 ./scripts/build-extension.sh --all   # build extension for all browsers
@@ -172,7 +172,9 @@ replaced (`The selected browser is gone ...`; the same browser coming back is
 picked up). `X-Webster-Owner` on the `initialize` request scopes native browser
 peers (`kind: "webkit"`, e.g. the Nostromo pane) to one owner. Webster only
 accepts loopback connections, expected `Host` headers, and non-web-page
-`Origin`s. Full contract, error texts and threat model:
+`Origin`s. A WebSocket gets one handshake; as an extension it must carry a
+`chrome-extension://`-style `Origin` (no-Origin sockets can only register as native
+peers). Full contract, error texts and threat model:
 [docs/browser-peers.md](docs/browser-peers.md).
 
 ## Tool Conventions
@@ -188,7 +190,7 @@ accepts loopback connections, expected `Host` headers, and non-web-page
 Tests use real WebSocket connections against a live `WebsterServer` instance on a random port. No mocks. Video tests require ffmpeg and are skipped in CI when unavailable. Never bind port 3456 in a test — the live server may be running there. GitHub Actions (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile`, `bun test` and `bun run typecheck` on every PR.
 
 ```bash
-bun test                    # all tests (404)
+bun test                    # all tests
 bun test --watch            # watch mode
 bun test src/__tests__/server.test.ts   # one file
 ```
@@ -229,6 +231,7 @@ cd menubar && swift build && .build/debug/WebsterMenu
 | `WEBSTER_PORT` | `3456` | Port for WebSocket, MCP HTTP, dashboard, and replay viewer |
 | `WEBSTER_ALLOW_NON_LOOPBACK` | unset | Set to `1` to disable the loopback-address and `Host` checks on every route. Webkit peer registration stays loopback-only regardless. Off by default |
 | `WEBSTER_RETENTION_HOURS` | `24` | Age at which a capture becomes eligible for deletion (plus a 24h grace notice). `0` disables deletion — retain indefinitely |
+| `WEBSTER_SESSION_IDLE_HOURS` | `6` | Idle time after which an MCP session with no open stream or in-flight request is expired (swept every 10 minutes). `0` disables expiry |
 
 ## Hard Rules
 

@@ -6,7 +6,7 @@ import {
   isConnectedEvent, isPeerState, isSelectForOwner, isUnregister,
   type WsCommand, type WsMessage, type WsEvent, type WsCaptureEvent, type WsCaptureDone, type WsCaptureBody,
 } from './protocol.js'
-import { isLoopbackAddress, isAllowedHost, isWebPageOrigin, ownerFingerprint } from './net-guard.js'
+import { isLoopbackAddress, isAllowedHost, isWebPageOrigin, isExtensionOrigin, ownerFingerprint } from './net-guard.js'
 import { INSTANCE_ID_RE, validateWebkitHandshake, validatePeerState, sanitizeReason } from './peer-validation.js'
 import { CaptureSession, cleanOldSessions, CAPTURES_DIR, parseCaptureConfig, type CaptureConfig, type CaptureEvent, type RetentionOptions } from './capture.js'
 import { buildStartCaptureResult, startCaptureDispatchFailureMessage } from './capture-result.js'
@@ -81,6 +81,9 @@ const RESERVED_PEER_NAME = 'nostromo'
 
 export class WebsterServer {
   private registry = new BrowserRegistry()
+  // Sockets that have completed a handshake. A socket gets exactly one — even
+  // after it unregisters — so a peer can never re-handshake as an extension.
+  private handshaken = new WeakSet<object>()
   private pending = new Map<string, PendingCommand>()
   private server: ExtServer
   private commandTimeout: number
@@ -625,14 +628,18 @@ export class WebsterServer {
   }
 
   private handleHandshake(ws: unknown, msg: WsEvent) {
-    const existing = this.registry.findByWs(ws)
-    const kind = msg.kind ?? 'extension'
+    const socket = ws as { close(code?: number, reason?: string): void }
+    const refuse = (reason: string) => {
+      console.error(`Webster: refused handshake (${reason})`)
+      socket.close(1008, reason)
+    }
 
+    // One handshake per socket: once registered (as anything) or unregistered,
+    // a socket may not register again, least of all under another kind or name.
+    if (this.handshaken.has(ws as object)) return refuse('one handshake per connection')
+
+    const kind = msg.kind ?? 'extension'
     if (kind === 'webkit') {
-      if (existing) {
-        console.error('Webster: ignoring webkit handshake on an already-registered connection')
-        return
-      }
       this.registerWebkitPeer(ws, msg)
       return
     }
@@ -641,21 +648,12 @@ export class WebsterServer {
       return
     }
 
-    if (msg.browser === RESERVED_PEER_NAME) {
-      console.error('Webster: refused extension handshake using the reserved peer name')
-      ;(ws as { close(code?: number, reason?: string): void }).close(1008, 'reserved browser name')
-      return
-    }
+    if (msg.browser === RESERVED_PEER_NAME) return refuse('reserved browser name')
 
-    // Check if this ws is already tracked (re-handshake)
-    if (existing) {
-      if (existing.kind !== 'extension') return
-      existing.browser = typeof msg.browser === 'string' ? msg.browser : existing.browser
-      existing.version = typeof msg.version === 'string' ? msg.version : existing.version
-      existing.engine = engineForExtension(existing.browser)
-      console.error(`Webster: extension v${existing.version} (${existing.browser}) re-connected`)
-      return
-    }
+    // A real extension's WebSocket carries an extension-scheme Origin. A socket
+    // with none (a native peer, a script) may only register as a webkit peer.
+    const conn = (ws as { data?: WsConnectionData }).data
+    if (!isExtensionOrigin(conn?.origin)) return refuse('extension origin required')
 
     const id = crypto.randomUUID() as string
     const browserName = typeof msg.browser === 'string' ? msg.browser : 'unknown'
@@ -672,6 +670,7 @@ export class WebsterServer {
       ws,
     }
     this.registry.add(ext)
+    this.handshaken.add(ws as object)
     console.error(`Webster: extension v${ext.version} (${ext.browser}) connected, id=${id}`)
   }
 
@@ -713,6 +712,7 @@ export class WebsterServer {
       toolSupport: peer.toolSupport,
       ws,
     })
+    this.handshaken.add(ws as object)
     console.error(`Webster: webkit peer v${peer.version} (${peer.browser}) connected, id=${id}, ownerFp=${ownerFingerprint(peer.owner)}`)
   }
 

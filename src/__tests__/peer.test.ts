@@ -442,7 +442,7 @@ describe('registration refusals (BP0-11)', () => {
   })
 
   test('an unknown message type is never treated as a handshake', async () => {
-    const raw = await rawSocket(rig.port)
+    const raw = await rawSocket(rig.port, { Origin: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop' })
     raw.send({ type: 'hello_world', version: '1.0', browser: 'chrome' })
     raw.send({ type: 'registration', kind: 'webkit', version: '1', browser: 'nostromo', instanceId: newInstanceId(), owner: T, engine: 'webkit', focus: { tag: 'a', name: 'b' }, profile: 'p', driver: 'agent', limitations: [] })
     await sleep(100)

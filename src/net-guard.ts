@@ -38,6 +38,18 @@ export function isWebPageOrigin(origin?: string | null): boolean {
   return o === 'null' || o.startsWith('http://') || o.startsWith('https://')
 }
 
+/**
+ * True when the Origin uses a browser-extension scheme. A WebSocket from a real
+ * Chrome/Edge/Firefox/Safari extension always carries one; a web page cannot
+ * send one, and a plain loopback client (a native peer, a script) sends none.
+ * A raw socket can still forge the header, so this is a filter, not a boundary.
+ */
+export function isExtensionOrigin(origin?: string | null): boolean {
+  if (origin == null) return false
+  const o = origin.trim().toLowerCase()
+  return o.startsWith('chrome-extension://') || o.startsWith('moz-extension://') || o.startsWith('safari-web-extension://')
+}
+
 /** First 8 hex chars of sha256(token) — the only form of the token that may be logged. */
 export function ownerFingerprint(token: string): string {
   return createHash('sha256').update(token).digest('hex').slice(0, 8)

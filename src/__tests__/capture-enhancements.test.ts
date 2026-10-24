@@ -14,7 +14,8 @@ function findFreePort(): Promise<number> {
 }
 
 async function connectExtension(port: number): Promise<WebSocket> {
-  const ws = new WebSocket(`ws://localhost:${port}`)
+  // A real extension's WebSocket upgrade carries a chrome-extension:// Origin.
+  const ws = new (WebSocket as any)(`ws://localhost:${port}`, { headers: { Origin: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop' } }) as WebSocket
   await new Promise<void>((resolve, reject) => {
     ws.onopen = () => resolve()
     ws.onerror = () => reject(new Error('WebSocket connection failed'))

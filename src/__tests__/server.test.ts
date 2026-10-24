@@ -15,7 +15,8 @@ function findFreePort(): Promise<number> {
 }
 
 async function connectExtension(port: number): Promise<WebSocket> {
-  const ws = new WebSocket(`ws://localhost:${port}`)
+  // A real extension's WebSocket upgrade carries a chrome-extension:// Origin.
+  const ws = new (WebSocket as any)(`ws://localhost:${port}`, { headers: { Origin: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop' } }) as WebSocket
   await new Promise<void>((resolve, reject) => {
     ws.onopen = () => resolve()
     ws.onerror = () => reject(new Error('WebSocket connection failed'))
@@ -131,9 +132,8 @@ describe('WebsterServer', () => {
     const ws = await connectAndHandshake(port)
     await new Promise(r => setTimeout(r, 20))
 
-    // Send the connected handshake event
-    ws.send(JSON.stringify({ type: 'connected', version: '0.1.0' }))
-
+    // The handshake was sent by connectAndHandshake; a socket gets exactly one
+    // (a second is refused, see handshake-hardening.test.ts).
     // Should not throw or cause any issues — wait a bit and verify server still works
     await new Promise(r => setTimeout(r, 50))
     expect(server.isConnected()).toBe(true)

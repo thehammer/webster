@@ -122,7 +122,10 @@ export interface FakeExtensionOptions {
   version?: string
   /** Extra handshake fields merged over the default handshake (undefined values are omitted). */
   handshake?: Record<string, unknown>
-  /** Upgrade headers (Origin, Host, ...). */
+  /**
+   * Upgrade headers (Origin, Host, ...). Defaults to a Chrome extension Origin, as a
+   * real extension sends one; pass `{}` for a WebSocket with no Origin at all.
+   */
   headers?: Record<string, string>
   /** Never reply to any command. */
   hang?: boolean
@@ -131,6 +134,11 @@ export interface FakeExtensionOptions {
 }
 
 export interface CloseInfo { code: number; reason: string }
+
+/** The Origin a Chrome/Edge MV3 extension service worker sends on its WebSocket upgrade. */
+export const CHROME_EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop'
+/** The Origin a Firefox extension background script sends. */
+export const FIREFOX_EXTENSION_ORIGIN = 'moz-extension://11111111-2222-3333-4444-555555555555'
 
 export interface FakeBrowser {
   ws: WebSocket
@@ -238,7 +246,7 @@ export async function connectFakeExtension(
   opts: FakeExtensionOptions = {},
 ): Promise<FakeBrowser> {
   const before = opts.skipRegistrationWait ? null : await counts(port)
-  const ws = await openSocket(port, opts.headers)
+  const ws = await openSocket(port, opts.headers ?? { Origin: CHROME_EXTENSION_ORIGIN })
   const closed = makeCloseTracker(ws)
   const driver = driveCommands(ws, browser, opts.hang === true)
 

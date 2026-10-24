@@ -58,9 +58,16 @@ kind, browserName, instanceId?, connectedAt, label, ... }`.
 4. **Otherwise** fail with the gone error (section 4). Webster **never** picks
    another browser.
 
-`set_browser(x)` resolves `x` among **visible** browsers only: an exact id
-first, then the first visible extension whose `browser` name equals `x` (webkit peers only match by name when no extension does). It stores
-an **explicit** binding. With no match it fails with
+`set_browser(x)` resolves `x` among **visible** browsers only, in this order:
+
+1. an exact id;
+2. a visible extension whose `browser` name equals `x`. If **two or more**
+   extensions share the name it fails with `'<x>' is ambiguous: ... select one
+   by id (see get_browsers)`: Webster never routes a name to whichever extension
+   connected first or last;
+3. a webkit peer by name, only when no extension matched.
+
+It stores an **explicit** binding. With no match it fails with
 `No connected extension matching '<x>'`. The same text is used for a pane that
 belongs to another owner, so a pane's existence never leaks to other focuses.
 
@@ -140,7 +147,7 @@ recognised by the presence of `id`. Webkit peers are WebSocket-only; HTTP
 
 | Field | Rule |
 |---|---|
-| `browser` | must be `nostromo` (default); any other name is refused so a peer cannot squat an extension's name. Extensions in turn cannot register as `nostromo` (WS handshake closed 1008, `POST /connect` 400) |
+| `browser` | must be `nostromo` (default); any other name is refused at the webkit handshake. Extensions in turn cannot register as `nostromo` (WS handshake closed 1008, `POST /connect` 400) |
 | `instanceId` | `^[A-Za-z0-9_-]{8,128}$`, required, stable per pane |
 | `owner` | the D1 token format, required |
 | `engine` | `^[a-z0-9-]{1,32}$`, default `webkit` |
@@ -164,6 +171,37 @@ without the token. This check is always applied, even with
 
 A handshake without `kind`, or with `kind: "extension"`, is the extension path.
 Extensions are **always** unowned: any `owner` they send is ignored.
+
+### Who may register as what (name squatting)
+
+- **One handshake per socket.** Once a socket has registered, as an extension or
+  a peer, or has `unregister`ed, any further `{"type":"connected"}` on it is
+  refused and the socket is closed with `1008`. A peer's socket can never turn
+  into an extension, not even right after `unregister`, and an extension cannot
+  rename itself.
+- **A WebSocket extension handshake must carry an extension-scheme `Origin`**
+  (`chrome-extension://`, `moz-extension://` or `safari-web-extension://`).
+  The browser adds it to the extension's `new WebSocket(url)` call itself (the
+  extension code sets no headers); the tests reproduce that header shape, but
+  no real browser is run against this check in CI. A WebSocket
+  with **no** `Origin` (a native peer, a script) may only register as
+  `kind: "webkit"`; as an extension it is closed `1008`. Web-page origins are
+  refused at the upgrade, as before.
+- **Safari** registers over HTTP (`POST /connect`), which keeps its own rules:
+  no `Origin` is required there, and `kind: "webkit"` is refused.
+- **Same-name extensions.** Two extensions may share a name (two profiles of one
+  browser, or a service-worker restart before the old socket is noticed gone), so
+  registration does not refuse the second one. Routing by name refuses instead
+  (`set_browser`, above), and a lost binding only rebinds when exactly one
+  candidate matches (section 3).
+
+What this covers: accidental squatting and squatting **by a native peer**. A
+peer cannot take an extension's name through its own socket, and a stray
+loopback client with no `Origin` cannot appear as an extension that owner
+sessions or extension captures would route to. What it does **not** cover: a
+hostile process running as the same user can open a raw socket and **forge** an
+extension `Origin` header, and then register under any extension name. Neither
+check is a boundary against that (see section 9).
 
 ### Later messages
 
@@ -248,10 +286,14 @@ Known limits:
   from a currently registered browser whose owner equals `captureOwner`. A socket
   that never handshook, or a peer that sent `unregister` (its socket stays open),
   is dropped, not treated as unowned. Sockets that do not register within 10s
-  are closed. Command results are likewise accepted only from the browser the
-  command was sent to. HTTP-transport pushes
-  (Safari) are the exception and are unowned. So an unowned reconnect still feeds an extension
-  capture, while pane events never enter a Chrome capture and vice versa.
+  are closed. Because a no-`Origin` socket cannot register as an extension
+  (section 5), only a real extension (or a forged `Origin`, section 9) can feed
+  an extension capture. Pane events never enter a Chrome capture and vice versa.
+- Command results over the **WebSocket** path are accepted only from the browser
+  the command was sent to. Results and capture pushes posted over **HTTP**
+  (`POST /result`, the Safari path) are **not** bound to a sender: the HTTP
+  transport is unowned and has no per-sender identity, so any loopback client
+  that knows a pending command id could answer it.
 - `stop_capture` finalizes the server-side session even when the browser can't be
   told to stop, and returns the snapshot plus
   `warning: "Could not tell the browser to stop capturing: <err>"`.
@@ -291,7 +333,11 @@ Entries add `kind` and `engine`. The body also has a top-level
 **What a hostile process running as the same macOS user can still do**
 
 - read the token from a Claude process's environment or config files;
-- register a fake pane or fake extension over loopback;
+- register a fake pane or fake extension over loopback (a raw socket can forge
+  the extension `Origin` header, so the Origin requirement and the
+  one-handshake-per-socket rule stop accidental and peer-originated name
+  squatting, not this);
+- answer a Safari (HTTP) command it can see the id of;
 - drive any pane with a stolen token.
 
 Webster cannot distinguish same-user processes over a loopback socket. That
@@ -303,3 +349,15 @@ protection plus network and web isolation, not a same-user security boundary**.
 
 Known gap: claiming a tab (`claim_tab`) still records the same owner for every
 session, so it does not coordinate across sessions.
+
+## 10. Idle MCP sessions
+
+A Claude client that crashes without sending `DELETE /mcp` never closes its
+transport, and a client that merely drops its SSE stream does not close it
+either, so its session context would live forever. Webster tracks the last
+request (and SSE activity) per session and, **every 10 minutes**, expires
+sessions idle longer than **6 hours** (`WEBSTER_SESSION_IDLE_HOURS`; `0`
+disables expiry). Expiry removes the session context and closes its transport; a
+later request with that `mcp-session-id` gets `404 Session not found` and the
+client re-initializes. A session with an in-flight request or an open SSE stream
+is never expired, and expiry never touches other sessions' owner or selection.
