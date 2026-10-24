@@ -29,7 +29,7 @@ Claude Code (HTTP MCP)
 ## Key Commands
 
 ```bash
-bun test                              # run tests (399 tests)
+bun test                              # run tests (404 tests)
 bun run typecheck                     # type check
 bun start                             # start MCP server manually
 ./scripts/build-extension.sh --all   # build extension for all browsers
@@ -188,7 +188,7 @@ accepts loopback connections, expected `Host` headers, and non-web-page
 Tests use real WebSocket connections against a live `WebsterServer` instance on a random port. No mocks. Video tests require ffmpeg and are skipped in CI when unavailable. Never bind port 3456 in a test — the live server may be running there. GitHub Actions (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile`, `bun test` and `bun run typecheck` on every PR.
 
 ```bash
-bun test                    # all tests (399)
+bun test                    # all tests (404)
 bun test --watch            # watch mode
 bun test src/__tests__/server.test.ts   # one file
 ```

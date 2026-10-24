@@ -281,6 +281,15 @@ export class WebsterServer {
       url.pathname === '/mcp' || url.pathname === '/connect' || url.pathname === '/poll' || url.pathname === '/result'
     if (webPageOrigin && guardedPath) return originRefused()
 
+    // State-changing /api calls (capture start/stop, session edits) must not be
+    // drivable cross-origin from a web page — a text/plain POST needs no preflight.
+    // The dashboard's own fetches are same-origin, so those stay allowed.
+    if (webPageOrigin && url.pathname.startsWith('/api/') && req.method !== 'GET' && req.method !== 'HEAD') {
+      let sameOrigin = false
+      try { sameOrigin = new URL(req.headers.get('origin')!).host === req.headers.get('host') } catch { /* opaque origin */ }
+      if (!sameOrigin) return originRefused()
+    }
+
     if (url.pathname === '/favicon.ico' || url.pathname === '/favicon.svg') {
       return new Response(FAVICON_SVG, {
         headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' },
@@ -413,8 +422,8 @@ export class WebsterServer {
       let reply: Record<string, unknown> | undefined
       try {
         reply = await this.dispatch({
-          action: 'startCapture',
           ...body,
+          action: 'startCapture', // after the spread: the request body must not choose the action
           streamToServer: true,
         }, 60000) as Record<string, unknown>
       } catch (e) {

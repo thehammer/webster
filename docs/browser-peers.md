@@ -217,6 +217,12 @@ Checked in `handleFetch` before routing, for every route:
   `moz-extension://`, `safari-web-extension://`) and an absent `Origin` (Claude
   Code's MCP client, native peers) are allowed. The dashboard and replay pages
   only call `/api/*` and `/replay/*`, so those routes are not Origin-checked.
+- **State-changing `/api/*` calls** (any method other than `GET`/`HEAD`) with a
+  web-page `Origin` are refused unless the `Origin` is the server's own
+  (same-origin, as the dashboard's fetches are). A text/plain `POST` needs no CORS
+  preflight, so without this a page could start or stop captures. The request
+  body of `/api/capture/start` also cannot override the command sent to the
+  browser.
 - **Escape hatch.** `WEBSTER_ALLOW_NON_LOOPBACK=1` disables the address and Host
   checks for every route **except** webkit peer registration. Off by default.
 

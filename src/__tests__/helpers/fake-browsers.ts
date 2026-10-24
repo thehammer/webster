@@ -69,8 +69,18 @@ export interface Rig {
 }
 
 export async function startRig(commandTimeoutMs = 2000): Promise<Rig> {
-  const port = await findFreePort()
-  const server = new WebsterServer(port, commandTimeoutMs)
+  // findFreePort() can lose the race for the port it returned (other processes
+  // allocate ephemeral ports too), so retry instead of flaking.
+  let port = await findFreePort()
+  let server: WebsterServer | undefined
+  for (let attempt = 0; !server; attempt++) {
+    try {
+      server = new WebsterServer(port, commandTimeoutMs)
+    } catch (err) {
+      if (attempt >= 4) throw err
+      port = await findFreePort()
+    }
+  }
   const mgr = new McpSessionManager(server)
   server.setMcpHandler((req) => mgr.handleRequest(req))
   return {

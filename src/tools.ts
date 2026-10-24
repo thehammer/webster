@@ -14,7 +14,7 @@ interface WebsterTool extends Tool {
 
 export function createTools(server: WebsterServer, ctx?: SessionContext): WebsterTool[] {
   function dispatch(action: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<unknown> {
-    return server.dispatch({ action, ...params }, timeoutMs, ctx)
+    return server.dispatch({ ...params, action }, timeoutMs, ctx)
   }
 
   const CAPTURE_TIMEOUT = 60000 // 60s — capture setup touches every tab
