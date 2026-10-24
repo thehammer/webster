@@ -59,7 +59,7 @@ kind, browserName, instanceId?, connectedAt, label, ... }`.
    another browser.
 
 `set_browser(x)` resolves `x` among **visible** browsers only: an exact id
-first, then the first visible browser whose `browser` name equals `x`. It stores
+first, then the first visible extension whose `browser` name equals `x` (webkit peers only match by name when no extension does). It stores
 an **explicit** binding. With no match it fails with
 `No connected extension matching '<x>'`. The same text is used for a pane that
 belongs to another owner, so a pane's existence never leaks to other focuses.
@@ -140,7 +140,7 @@ recognised by the presence of `id`. Webkit peers are WebSocket-only; HTTP
 
 | Field | Rule |
 |---|---|
-| `browser` | `^[a-z0-9-]{1,32}$`, default `nostromo` |
+| `browser` | must be `nostromo` (default); any other name is refused so a peer cannot squat an extension's name |
 | `instanceId` | `^[A-Za-z0-9_-]{8,128}$`, required, stable per pane |
 | `owner` | the D1 token format, required |
 | `engine` | `^[a-z0-9-]{1,32}$`, default `webkit` |
@@ -225,6 +225,19 @@ Checked in `handleFetch` before routing, for every route:
   browser.
 - **Escape hatch.** `WEBSTER_ALLOW_NON_LOOPBACK=1` disables the address and Host
   checks for every route **except** webkit peer registration. Off by default.
+  It also drops owner isolation from the network: a remote caller can send any
+  `X-Webster-Owner` and so act as that owner.
+
+Known limits:
+
+- **Not loopback-bound.** `lsof` still shows `*:3456`. Webster refuses
+  non-loopback peers instead of binding loopback-only: Bun's `serve` takes one
+  `hostname`, and binding `127.0.0.1` or `::1` alone breaks `localhost` for the
+  other family. A LAN host can still open a TCP connection and hold it idle
+  (Webster disables the HTTP idle timeout for long-polls; a WebSocket that
+  never handshakes is closed after 10s); it never gets past the `403`.
+- **Extension schemes are allow-listed wholesale.** Any installed extension
+  (not just Webster's) with host permission for `localhost` can drive Webster.
 
 ## 7. Captures (D7)
 
@@ -232,8 +245,12 @@ Checked in `handleFetch` before routing, for every route:
 - A capture records `captureOwner`: the owner of the browser `start_capture`
   dispatched to (`null` for extensions and for `/api/capture/start`).
 - `capture_event`, `capture_body` and `capture_done` pushes are accepted only
-  from a connection whose owner equals `captureOwner`; HTTP-transport pushes
-  (Safari) are unowned. So an unowned reconnect still feeds an extension
+  from a currently registered browser whose owner equals `captureOwner`. A socket
+  that never handshook, or a peer that sent `unregister` (its socket stays open),
+  is dropped, not treated as unowned. Sockets that do not register within 10s
+  are closed. Command results are likewise accepted only from the browser the
+  command was sent to. HTTP-transport pushes
+  (Safari) are the exception and are unowned. So an unowned reconnect still feeds an extension
   capture, while pane events never enter a Chrome capture and vice versa.
 - `stop_capture` finalizes the server-side session even when the browser can't be
   told to stop, and returns the snapshot plus

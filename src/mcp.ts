@@ -107,6 +107,14 @@ export class McpSessionManager {
       },
     })
 
+    // Sessions that die without a DELETE (transport closed) must not leak their context.
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        this.sessions.delete(transport.sessionId)
+        this.wsServer.forgetSession(transport.sessionId)
+      }
+    }
+
     const server = buildMcpServer(this.wsServer, ctx)
     await server.connect(transport)
     return transport.handleRequest(req)

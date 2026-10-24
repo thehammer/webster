@@ -519,7 +519,7 @@ export interface RawHttpResponse {
 
 export function rawHttp(
   port: number,
-  req: { method?: string; path?: string; headers?: Record<string, string>; body?: string },
+  req: { method?: string; path?: string; headers?: Record<string, string>; body?: string; /** Address to connect to (default 127.0.0.1). */ connectHost?: string },
 ): Promise<RawHttpResponse> {
   const method = req.method ?? 'GET'
   const path = req.path ?? '/'
@@ -566,7 +566,7 @@ export function rawHttp(
     }
     const timer = setTimeout(() => { if (!done) { done = true; reject(new Error(`rawHttp timeout for ${method} ${path}`)) } }, 4000)
     Bun.connect({
-      hostname: '127.0.0.1',
+      hostname: req.connectHost ?? '127.0.0.1',
       port,
       socket: {
         open(sock) { sock.write(wire) },

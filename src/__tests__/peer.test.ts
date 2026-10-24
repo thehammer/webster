@@ -574,3 +574,40 @@ describe('peer helper sanity', () => {
     expect(await closedWithin(peer, 50)).toBeNull()
   })
 })
+
+describe('webkit peers cannot take an extension browser\'s name (WF-2)', () => {
+  test('a handshake claiming browser "chrome" is refused with 1008 and not registered', async () => {
+    const before = await getStatus(rig.port)
+    const peer = await connectFakePeer(rig.port, { owner: T, browser: 'chrome', awaitRegistration: false })
+    const closed = await closedWithin(peer, 1500)
+    expect(closed?.code).toBe(1008)
+    const after = await getStatus(rig.port)
+    expect(after.ownedBrowserCount ?? 0).toBe(before.ownedBrowserCount ?? 0)
+    expect(after.extensions.length).toBe(before.extensions.length)
+  })
+
+  test('browser "nostromo" and an omitted browser are both accepted', async () => {
+    const a = await connectFakePeer(rig.port, { owner: T, browser: 'nostromo' })
+    const b = await connectFakePeer(rig.port, { owner: T, overrides: { browser: undefined } })
+    expect(await closedWithin(a, 150)).toBeNull()
+    expect(await closedWithin(b, 150)).toBeNull()
+    const s = await mcpSession(rig.port, T)
+    expect((await s.browsers()).filter((e) => e.kind === 'webkit').map((e) => e.browser)).toEqual(['nostromo', 'nostromo'])
+  })
+
+  for (const peerFirst of [true, false]) {
+    test(`set_browser("chrome") reaches the real extension, never the owner's peer (${peerFirst ? 'peer' : 'extension'} connected first)`, async () => {
+      let peer!: FakePeer
+      if (peerFirst) peer = await connectFakePeer(rig.port, { owner: T })
+      const chrome = await connectFakeExtension(rig.port, 'chrome')
+      if (!peerFirst) peer = await connectFakePeer(rig.port, { owner: T })
+      const s = await mcpSession(rig.port, T)
+
+      expect((await s.callTool('set_browser', { browser: 'chrome' })).isError).toBe(false)
+      const r = await s.callTool('get_tabs')
+      expect(r.json.by).toBe('chrome')
+      expect(chrome.actions()).toEqual(['getTabs'])
+      expect(peer.received).toEqual([])
+    })
+  }
+})

@@ -238,7 +238,10 @@ export class BrowserRegistry {
     const visible = this.all().filter((b) => this.isVisible(b, ctx))
     // Try exact id match first, then browser name match. Invisible browsers never match,
     // so a pane's existence doesn't leak to other focuses.
-    const found = visible.find((b) => b.id === idOrBrowserName) ?? visible.find((b) => b.browser === idOrBrowserName)
+    // Extensions win a name match, so a native peer never takes an extension browser's name.
+    const found = visible.find((b) => b.id === idOrBrowserName) ??
+      visible.find((b) => b.kind !== 'webkit' && b.browser === idOrBrowserName) ??
+      visible.find((b) => b.browser === idOrBrowserName)
     if (!found) {
       throw new Error(`No connected extension matching '${idOrBrowserName}'`)
     }

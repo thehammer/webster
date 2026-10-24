@@ -9,7 +9,6 @@ import { OWNER_TOKEN_RE } from './net-guard.js'
  */
 
 export const INSTANCE_ID_RE = /^[A-Za-z0-9_-]{8,128}$/
-const BROWSER_NAME_RE = /^[a-z0-9-]{1,32}$/
 const ENGINE_RE = /^[a-z0-9-]{1,32}$/
 const TOOL_NAME_RE = /^[A-Za-z0-9_]{1,64}$/
 
@@ -109,8 +108,9 @@ export function validateWebkitHandshake(msg: WsEvent): Result<PeerRegistration> 
   const version = str(m.version, 64)
   if (version === null) return fail('invalid version')
 
+  // Webkit peers are always `nostromo`: they must not squat an extension browser's name.
   const browser = m.browser === undefined ? 'nostromo' : m.browser
-  if (typeof browser !== 'string' || !BROWSER_NAME_RE.test(browser)) return fail('invalid browser name')
+  if (browser !== 'nostromo') return fail('invalid browser name')
 
   if (typeof m.instanceId !== 'string' || !INSTANCE_ID_RE.test(m.instanceId)) return fail('invalid instanceId')
   if (typeof m.owner !== 'string' || !OWNER_TOKEN_RE.test(m.owner)) return fail('invalid owner')

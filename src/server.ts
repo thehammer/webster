@@ -73,6 +73,9 @@ export type { Binding, SessionContext, BrowserInfo } from './browser-registry.js
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ExtServer = Bun.Server<any>
 
+/** A WebSocket that has not registered as a browser within this long is closed. */
+const HANDSHAKE_TIMEOUT_MS = 10_000
+
 export class WebsterServer {
   private registry = new BrowserRegistry()
   private pending = new Map<string, PendingCommand>()
@@ -100,9 +103,11 @@ export class WebsterServer {
   // default-on sweep would point them all at the operator's real captures.
   private retentionTimer: ReturnType<typeof setInterval> | null = null
   private retentionOptions: RetentionOptions | null = null
+  private handshakeTimeoutMs: number
 
-  constructor(port: number, commandTimeout = 30000, options?: { retention?: boolean | RetentionOptions }) {
+  constructor(port: number, commandTimeout = 30000, options?: { retention?: boolean | RetentionOptions; handshakeTimeoutMs?: number }) {
     this.commandTimeout = commandTimeout
+    this.handshakeTimeoutMs = options?.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS
 
     if (options?.retention) {
       this.retentionOptions = options.retention === true ? {} : options.retention
@@ -550,9 +555,15 @@ export class WebsterServer {
     }
   }
 
-  private handleOpen(_ws: unknown) {
+  private handleOpen(ws: unknown) {
     // Don't track yet — wait for the { type: 'connected' } handshake message.
     // This prevents test clients or stray connections from hijacking the slot.
+    // A socket that never registers is closed after a short bound.
+    const timer = setTimeout(() => {
+      if (this.registry.findByWs(ws)) return
+      try { (ws as { close(code?: number, reason?: string): void }).close(1008, 'handshake timeout') } catch { /* already closed */ }
+    }, this.handshakeTimeoutMs)
+    timer.unref?.()
   }
 
   private handleMessage(ws: unknown, data: string | Buffer) {
@@ -566,13 +577,16 @@ export class WebsterServer {
     if (typeof msg !== 'object' || msg === null) return
 
     // Capture push events — a browser streaming data to the server
+    // Only a currently registered browser may push (an un-handshaken socket, or
+    // a peer that unregistered, has no owner and must not read as unowned).
     if (isCapturePush(msg)) {
-      this.handleCaptureEvent(msg, this.registry.findByWs(ws)?.owner ?? null)
+      const sender = this.registry.findByWs(ws)
+      if (sender) this.handleCaptureEvent(msg, sender.owner)
       return
     }
 
     if (isResult(msg)) {
-      this.handleResult(msg)
+      this.handleResult(msg, this.registry.findByWs(ws))
       return
     }
 
@@ -590,9 +604,11 @@ export class WebsterServer {
     }
   }
 
-  private handleResult(msg: { id: string; success: boolean; data?: unknown; error?: string }) {
+  private handleResult(msg: { id: string; success: boolean; data?: unknown; error?: string }, sender: ConnectedBrowser | undefined) {
     const pending = this.pending.get(msg.id)
     if (!pending) return
+    // A result only counts when it comes from the browser the command went to.
+    if (!sender || sender.id !== pending.browserId) return
 
     clearTimeout(pending.timeoutHandle)
     this.pending.delete(msg.id)

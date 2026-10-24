@@ -4,8 +4,10 @@
  * finalizes the server-side session.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { WebsterServer } from '../server.js'
 import {
   startRig, connectFakeExtension, connectFakePeer, mcpSession, sleep, eventually, getStatus, token,
+  rawSocket, findFreePort, closedWithin,
   type Rig,
 } from './helpers/fake-browsers.js'
 
@@ -238,5 +240,62 @@ describe('legacy /api/capture/* with a peer connected (BP0-16)', () => {
     const stop = await fetch(`http://localhost:${rig.port}/api/capture/stop`, { method: 'POST' })
     expect(stop.status).toBe(200)
     expect(rig.server.getCaptureSession()?.active).toBe(false)
+  })
+})
+
+describe('only a registered browser may push into a capture (WF-1)', () => {
+  test('an un-handshaken socket cannot inject events or finalize an extension capture', async () => {
+    const chrome = await connectFakeExtension(rig.port, 'chrome')
+    chrome.setReply('startCapture', { tabsAttached: 1 })
+    await startOn(await mcpSession(rig.port))
+    const stranger = await rawSocket(rig.port)
+
+    stranger.send(networkPush('https://stranger.example/inject'))
+    stranger.send({ type: 'capture_done' })
+    await sleep(80)
+    expect(urls()).toEqual([])
+    expect(rig.server.getCaptureSession()?.active).toBe(true)
+
+    chrome.send(networkPush('https://chrome.example/ok'))
+    await eventually(() => urls().includes('https://chrome.example/ok'), { what: 'registered extension event' })
+    expect(urls()).toEqual(['https://chrome.example/ok'])
+  })
+
+  test('a peer that unregistered (socket still open) cannot inject events or finalize an extension capture', async () => {
+    const chrome = await connectFakeExtension(rig.port, 'chrome')
+    chrome.setReply('startCapture', { tabsAttached: 1 })
+    const peer = await connectFakePeer(rig.port, { owner: T })
+    await startOn(await mcpSession(rig.port))
+
+    peer.unregister('pane closed')
+    await eventually(async () => (await getStatus(rig.port)).ownedBrowserCount === 0, { what: 'peer removed' })
+    expect(peer.ws.readyState).toBe(WebSocket.OPEN)
+
+    peer.send(networkPush('https://peer.example/after-unregister'))
+    peer.send({ type: 'capture_done' })
+    await sleep(80)
+    expect(urls()).toEqual([])
+    expect(rig.server.getCaptureSession()?.active).toBe(true)
+
+    chrome.send(networkPush('https://chrome.example/ok'))
+    await eventually(() => urls().includes('https://chrome.example/ok'), { what: 'registered extension event' })
+  })
+})
+
+describe('handshake timeout (WF-1)', () => {
+  test('a socket that never registers is closed with 1008; a registered one is left alone', async () => {
+    const port = await findFreePort()
+    const server = new WebsterServer(port, 2000, { handshakeTimeoutMs: 200 })
+    try {
+      const silent = await rawSocket(port)
+      const chrome = await connectFakeExtension(port, 'chrome')
+      const closed = await closedWithin(silent, 1500)
+      expect(closed?.code).toBe(1008)
+      expect(await closedWithin({ closed: chrome.closed }, 400)).toBeNull()
+      expect(chrome.ws.readyState).toBe(WebSocket.OPEN)
+      await chrome.close()
+    } finally {
+      server.close()
+    }
   })
 })
