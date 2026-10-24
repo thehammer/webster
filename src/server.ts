@@ -3,10 +3,17 @@ import { join } from 'path'
 import { homedir } from 'os'
 import {
   isResult, isCaptureEvent, isCaptureDone, isCaptureBody, isCapturePush,
-  type WsCommand, type WsMessage, type WsCaptureEvent, type WsCaptureDone, type WsCaptureBody,
+  isConnectedEvent, isPeerState, isSelectForOwner, isUnregister,
+  type WsCommand, type WsMessage, type WsEvent, type WsCaptureEvent, type WsCaptureDone, type WsCaptureBody,
 } from './protocol.js'
+import { isLoopbackAddress, isAllowedHost, isWebPageOrigin, ownerFingerprint } from './net-guard.js'
+import { INSTANCE_ID_RE, validateWebkitHandshake, validatePeerState, sanitizeReason } from './peer-validation.js'
 import { CaptureSession, cleanOldSessions, CAPTURES_DIR, parseCaptureConfig, type CaptureConfig, type CaptureEvent, type RetentionOptions } from './capture.js'
 import { buildStartCaptureResult, startCaptureDispatchFailureMessage } from './capture-result.js'
+import {
+  BrowserRegistry, engineForExtension, goneMessage, labelOf,
+  type BrowserInfo, type ConnectedBrowser, type SessionContext,
+} from './browser-registry.js'
 import { handleReplayRequest } from './replay.js'
 import { buildDashboardHtml } from './dashboard.js'
 import { FAVICON_SVG } from './favicon.js'
@@ -50,24 +57,24 @@ interface PendingCommand {
   resolve: (data: unknown) => void
   reject: (err: Error) => void
   timeoutHandle: ReturnType<typeof setTimeout>
+  /** The browser the command was sent to — a disconnect only fails its own commands. */
+  browserId: string
 }
 
-interface ConnectedExtension {
-  id: string
-  browser: string
-  version: string
-  transport: 'ws' | 'http'
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  ws?: any
-  pollResolve?: ((cmd: WsCommand) => void) | null
+/** Per-connection data attached at WebSocket upgrade (D6). */
+interface WsConnectionData {
+  remoteAddress: string | undefined
+  origin: string | null
+  host: string | null
 }
+
+export type { Binding, SessionContext, BrowserInfo } from './browser-registry.js'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ExtServer = Bun.Server<any>
 
 export class WebsterServer {
-  private extensions = new Map<string, ConnectedExtension>()
-  private activeExtensionId: string | null = null
+  private registry = new BrowserRegistry()
   private pending = new Map<string, PendingCommand>()
   private server: ExtServer
   private commandTimeout: number
@@ -83,6 +90,9 @@ export class WebsterServer {
 
   // Active capture session — receives push events from extension
   private captureSession: CaptureSession | null = null
+  // Owner of the browser the capture was started on (null = extensions). Pushes
+  // from a connection with a different owner are ignored (D7).
+  private captureOwner: string | null = null
   private startedAt = Date.now()
 
   // Retention sweep — opt-in only. Constructing a server must never start a
@@ -124,9 +134,152 @@ export class WebsterServer {
     this.mcpHandler = handler
   }
 
+  // ─── Per-session selection (see browser-registry.ts) ─────────────────────
+
+  createSessionContext(owner: string | null): SessionContext {
+    return this.registry.createSessionContext(owner)
+  }
+
+  registerSession(ctx: SessionContext): void {
+    this.registry.registerSession(ctx)
+  }
+
+  forgetSession(id: string): void {
+    this.registry.forgetSession(id)
+  }
+
+  peek(ctx: SessionContext): ConnectedBrowser | null {
+    return this.registry.peek(ctx)
+  }
+
+  getBrowsers(ctx?: SessionContext): BrowserInfo[] {
+    return this.registry.list(ctx)
+  }
+
+  setBrowser(idOrBrowserName: string, ctx: SessionContext): BrowserInfo {
+    return this.registry.select(idOrBrowserName, ctx)
+  }
+
+  /**
+   * Send a command to a browser. With a session context the target is that
+   * session's binding; without one (the HTTP API and legacy callers) it is the
+   * server default, re-evaluated each time.
+   */
+  dispatch(command: Omit<WsCommand, 'id'>, timeoutMs?: number, ctx?: SessionContext): Promise<unknown> {
+    let target: ConnectedBrowser
+    try {
+      target = ctx ? this.registry.resolve(ctx) : this.defaultBrowser()
+    } catch (err) {
+      return Promise.reject(err)
+    }
+    return this.sendTo(target, command, timeoutMs)
+  }
+  isConnected(): boolean {
+    return this.registry.serverDefault() !== null
+  }
+
+  // ─── Registry ────────────────────────────────────────────────────────────
+
+  registerSelf(): void {
+    const alive = readRegistry().filter(e => isProcessAlive(e.pid))
+    alive.push({ port: this.port, pid: process.pid, started: new Date().toISOString() })
+    writeRegistry(alive)
+  }
+
+  deregisterSelf(): void {
+    const remaining = readRegistry().filter(e => !(e.port === this.port && e.pid === process.pid))
+    writeRegistry(remaining)
+  }
+
+  // ─── Tab ownership ───────────────────────────────────────────────────────
+
+  claimTab(tabId: number | undefined): { claimed: boolean; tabId: number | null; owner: string } {
+    if (tabId == null) {
+      return { claimed: false, tabId: null, owner: '', }
+    }
+    const owner = `${this.port}:${process.pid}`
+    this.tabOwnership.set(tabId, owner)
+    return { claimed: true, tabId, owner }
+  }
+
+  releaseTab(tabId: number | undefined): void {
+    if (tabId != null) this.tabOwnership.delete(tabId)
+  }
+
+  getClaimedTabs(): Array<{ tabId: number; owner: string }> {
+    return [...this.tabOwnership.entries()].map(([tabId, owner]) => ({ tabId, owner }))
+  }
+
+  // ─── Capture session management ───────────────────────────────────────
+
+  startCaptureSession(config: CaptureConfig, ctx?: SessionContext): CaptureSession {
+    // Stop any existing session
+    if (this.captureSession?.active) {
+      this.captureSession.finalize()
+    }
+    // The capture belongs to whichever browser the start command will reach.
+    this.captureOwner = (ctx ? this.peek(ctx)?.owner : null) ?? null
+    const id = crypto.randomUUID() as string
+    this.captureSession = new CaptureSession(id, config)
+    return this.captureSession
+  }
+
+  getCaptureSession(): CaptureSession | null {
+    return this.captureSession
+  }
+
+  stopCaptureSession(): CaptureSession | null {
+    const session = this.captureSession
+    if (session?.active) {
+      session.finalize()
+    }
+    return session
+  }
+
+  // ─── Retention ────────────────────────────────────────────────────────
+
+  /** True while a retention sweep timer is armed. Off unless opted in. */
+  get retentionEnabled(): boolean {
+    return this.retentionTimer !== null
+  }
+
+  // ─── Lifecycle ────────────────────────────────────────────────────────
+
+  close(): void {
+    if (this.retentionTimer) {
+      clearInterval(this.retentionTimer)
+      this.retentionTimer = null
+    }
+    if (this.captureSession?.active) {
+      this.captureSession.finalize()
+    }
+    this.deregisterSelf()
+    this.server.stop(true)
+  }
+
+  // ─── Internals ───────────────────────────────────────────────────────────
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async handleFetch(req: Request, server: any): Promise<Response> {
     const url = new URL(req.url)
+
+    // D6: loopback + Host on every route. Rejecting by peer address (not by
+    // bind address) avoids IPv4/IPv6 `localhost` resolution surprises.
+    if (process.env.WEBSTER_ALLOW_NON_LOOPBACK !== '1') {
+      if (!isLoopbackAddress(server.requestIP(req)?.address)) {
+        return new Response('Webster accepts loopback connections only', { status: 403 })
+      }
+      if (!isAllowedHost(req.headers.get('host'))) {
+        return new Response('Webster: unexpected Host header', { status: 403 })
+      }
+    }
+
+    // D6: web pages must not reach the extension and MCP endpoints.
+    const webPageOrigin = isWebPageOrigin(req.headers.get('origin'))
+    const originRefused = (): Response => new Response('Webster: web page origins are not allowed', { status: 403 })
+    const guardedPath =
+      url.pathname === '/mcp' || url.pathname === '/connect' || url.pathname === '/poll' || url.pathname === '/result'
+    if (webPageOrigin && guardedPath) return originRefused()
 
     if (url.pathname === '/favicon.ico' || url.pathname === '/favicon.svg') {
       return new Response(FAVICON_SVG, {
@@ -140,56 +293,55 @@ export class WebsterServer {
     }
 
     if (req.method === 'POST' && url.pathname === '/connect') {
-      let body: { browser?: string; version?: string } = {}
+      let body: { kind?: unknown; browser?: unknown; version?: unknown; instanceId?: unknown } = {}
       try {
-        body = await req.json() as { browser?: string; version?: string }
+        body = await req.json() as typeof body
       } catch {
         // ignore — body is optional for backward compat
       }
+      // Native peers register over WebSocket only.
+      if (body.kind !== undefined && body.kind !== 'extension') {
+        return Response.json({ error: 'Only extensions can register over HTTP' }, { status: 400 })
+      }
+      const browserName = typeof body.browser === 'string' ? body.browser : 'unknown'
       // Evict any stale HTTP connections for the same browser (SW restart without clean disconnect)
-      const browserName = body.browser ?? 'unknown'
-      for (const [existingId, existing] of this.extensions) {
+      for (const existing of this.registry.all()) {
         if (existing.transport === 'http' && existing.browser === browserName) {
-          this.extensions.delete(existingId)
-          if (this.activeExtensionId === existingId) this.activeExtensionId = null
+          this.removeBrowser(existing)
         }
       }
 
       const id = crypto.randomUUID() as string
-      const ext: ConnectedExtension = {
+      const ext: ConnectedBrowser = {
         id,
         browser: browserName,
-        version: body.version ?? 'unknown',
+        version: typeof body.version === 'string' ? body.version : 'unknown',
         transport: 'http',
+        kind: 'extension',
+        owner: null,
+        instanceId: typeof body.instanceId === 'string' && INSTANCE_ID_RE.test(body.instanceId) ? body.instanceId : undefined,
+        connectedAt: this.registry.nextConnectedAt(),
+        engine: engineForExtension(browserName),
         pollResolve: null,
       }
-      this.extensions.set(id, ext)
-      if (this.activeExtensionId === null) {
-        this.activeExtensionId = id
-      }
+      this.registry.add(ext)
       console.error(`Webster: extension v${ext.version} (${ext.browser}) connected (HTTP), id=${id}`)
       return Response.json({ id })
     }
 
     if (req.method === 'DELETE' && url.pathname === '/connect') {
       const id = url.searchParams.get('id') ?? null
-      if (id) {
-        const ext = this.extensions.get(id)
-        if (ext) {
-          this.extensions.delete(id)
-          if (this.activeExtensionId === id) {
-            this.activeExtensionId = this.extensions.size > 0 ? this.extensions.keys().next().value! : null
-          }
-          console.error(`Webster: extension disconnected (HTTP), id=${id}`)
-          this.rejectPendingOnDisconnect()
-        }
+      const ext = id ? this.registry.get(id) : undefined
+      if (ext && ext.transport === 'http') {
+        this.removeBrowser(ext)
+        console.error(`Webster: extension disconnected (HTTP), id=${id}`)
       }
       return new Response(null, { status: 204 })
     }
 
     if (req.method === 'GET' && url.pathname === '/poll') {
       const id = url.searchParams.get('id') ?? null
-      const ext = id ? this.extensions.get(id) : null
+      const ext = id ? this.registry.get(id) : null
       if (!ext || ext.transport !== 'http') {
         return new Response('Unknown extension id', { status: 404 })
       }
@@ -244,6 +396,7 @@ export class WebsterServer {
         pid: process.pid,
         port: this.port,
         extensions: this.getBrowsers(),
+        ownedBrowserCount: this.registry.all().filter((b) => b.owner !== null).length,
         capture: snap ? { active: true, sessionId: snap.sessionId, duration: snap.duration, eventCount: snap.eventCount, frameCount: snap.frameCount } : { active: false },
         sessionCount: this.countSessions(),
       })
@@ -330,14 +483,20 @@ export class WebsterServer {
     }
 
     // Attempt WebSocket upgrade for all other requests
-    if (server.upgrade(req)) return undefined as unknown as Response
+    if (webPageOrigin) return originRefused()
+    const data: WsConnectionData = {
+      remoteAddress: server.requestIP(req)?.address,
+      origin: req.headers.get('origin'),
+      host: req.headers.get('host'),
+    }
+    if (server.upgrade(req, { data })) return undefined as unknown as Response
     return new Response('Webster MCP server', { status: 200 })
   }
 
   private handleHttpResult(msg: WsMessage) {
     // Capture push events via HTTP (Safari path)
     if (isCapturePush(msg)) {
-      this.handleCaptureEvent(msg)
+      this.handleCaptureEvent(msg, null) // the HTTP transport is extension-only, hence unowned
       return
     }
 
@@ -364,11 +523,21 @@ export class WebsterServer {
     }
   }
 
-  private rejectPendingOnDisconnect() {
+  // ─── Connections ─────────────────────────────────────────────────────────
+
+  /** Drop a connection and fail only the commands that were sent to it. */
+  private removeBrowser(browser: ConnectedBrowser, reason?: string): void {
+    this.registry.remove(browser)
+    this.rejectPendingFor(browser, reason)
+  }
+
+  private rejectPendingFor(browser: ConnectedBrowser, reason?: string): void {
+    const message = `Extension disconnected. ${goneMessage(labelOf(browser), reason)}`
     for (const [id, pending] of this.pending) {
+      if (pending.browserId !== browser.id) continue
       clearTimeout(pending.timeoutHandle)
-      pending.reject(new Error('Extension disconnected'))
       this.pending.delete(id)
+      pending.reject(new Error(message))
     }
   }
 
@@ -382,43 +551,37 @@ export class WebsterServer {
     try {
       msg = JSON.parse(typeof data === 'string' ? data : data.toString())
     } catch {
-      console.error('Webster: failed to parse message', data)
+      console.error('Webster: failed to parse message') // never echo the payload: a handshake carries the owner token
       return
     }
+    if (typeof msg !== 'object' || msg === null) return
 
-    // Capture push events — extension streaming data to server
+    // Capture push events — a browser streaming data to the server
     if (isCapturePush(msg)) {
-      this.handleCaptureEvent(msg)
+      this.handleCaptureEvent(msg, this.registry.findByWs(ws)?.owner ?? null)
       return
     }
 
-    if (!isResult(msg)) {
-      // It's a WsEvent — the extension identifying itself
-      // Check if this ws is already tracked (re-handshake)
-      const existing = [...this.extensions.values()].find((e) => e.ws === ws)
-      if (existing) {
-        existing.browser = msg.browser ?? existing.browser
-        existing.version = msg.version
-        console.error(`Webster: extension v${existing.version} (${existing.browser}) re-connected`)
-        return
-      }
-
-      const id = crypto.randomUUID() as string
-      const ext: ConnectedExtension = {
-        id,
-        browser: msg.browser ?? 'unknown',
-        version: msg.version,
-        transport: 'ws',
-        ws,
-      }
-      this.extensions.set(id, ext)
-      if (this.activeExtensionId === null) {
-        this.activeExtensionId = id
-      }
-      console.error(`Webster: extension v${ext.version} (${ext.browser}) connected, id=${id}`)
+    if (isResult(msg)) {
+      this.handleResult(msg)
       return
     }
 
+    // Everything else is keyed on `type`. Unknown types are never a handshake.
+    if (isConnectedEvent(msg)) {
+      this.handleHandshake(ws, msg)
+    } else if (isPeerState(msg)) {
+      this.handlePeerState(ws, msg)
+    } else if (isSelectForOwner(msg)) {
+      this.handleSelectForOwner(ws)
+    } else if (isUnregister(msg)) {
+      this.handleUnregister(ws, msg.reason)
+    } else {
+      console.error(`Webster: ignoring message with unknown type '${String((msg as { type?: unknown }).type).slice(0, 40)}'`)
+    }
+  }
+
+  private handleResult(msg: { id: string; success: boolean; data?: unknown; error?: string }) {
     const pending = this.pending.get(msg.id)
     if (!pending) return
 
@@ -432,70 +595,139 @@ export class WebsterServer {
     }
   }
 
+  private handleHandshake(ws: unknown, msg: WsEvent) {
+    const existing = this.registry.findByWs(ws)
+    const kind = msg.kind ?? 'extension'
+
+    if (kind === 'webkit') {
+      if (existing) {
+        console.error('Webster: ignoring webkit handshake on an already-registered connection')
+        return
+      }
+      this.registerWebkitPeer(ws, msg)
+      return
+    }
+    if (kind !== 'extension') {
+      console.error('Webster: ignoring handshake with unknown kind')
+      return
+    }
+
+    // Check if this ws is already tracked (re-handshake)
+    if (existing) {
+      if (existing.kind !== 'extension') return
+      existing.browser = typeof msg.browser === 'string' ? msg.browser : existing.browser
+      existing.version = typeof msg.version === 'string' ? msg.version : existing.version
+      existing.engine = engineForExtension(existing.browser)
+      console.error(`Webster: extension v${existing.version} (${existing.browser}) re-connected`)
+      return
+    }
+
+    const id = crypto.randomUUID() as string
+    const browserName = typeof msg.browser === 'string' ? msg.browser : 'unknown'
+    const ext: ConnectedBrowser = {
+      id,
+      browser: browserName,
+      version: typeof msg.version === 'string' ? msg.version : 'unknown',
+      transport: 'ws',
+      kind: 'extension',
+      owner: null, // extensions are always unowned: any `owner` they send is ignored
+      instanceId: typeof msg.instanceId === 'string' && INSTANCE_ID_RE.test(msg.instanceId) ? msg.instanceId : undefined,
+      connectedAt: this.registry.nextConnectedAt(),
+      engine: engineForExtension(browserName),
+      ws,
+    }
+    this.registry.add(ext)
+    console.error(`Webster: extension v${ext.version} (${ext.browser}) connected, id=${id}`)
+  }
+
+  /** Register a native peer, or refuse it by closing the socket with 1008 (D5). */
+  private registerWebkitPeer(ws: unknown, msg: WsEvent) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const socket = ws as any
+    const refuse = (reason: string) => {
+      console.error(`Webster: refused webkit peer registration (${reason})`)
+      socket.close(1008, reason)
+    }
+
+    // Always loopback-only and Origin-free, even with WEBSTER_ALLOW_NON_LOOPBACK.
+    const conn = socket.data as WsConnectionData | undefined
+    if (!conn || !isLoopbackAddress(conn.remoteAddress)) return refuse('not loopback')
+    if (conn.origin !== null) return refuse('Origin header present')
+
+    const parsed = validateWebkitHandshake(msg)
+    if (!parsed.ok) return refuse(parsed.reason)
+    const peer = parsed.value
+
+    if (this.registry.hasWebkitInstance(peer.instanceId)) return refuse('instanceId already registered')
+
+    const id = crypto.randomUUID() as string
+    this.registry.add({
+      id,
+      browser: peer.browser,
+      version: peer.version,
+      transport: 'ws',
+      kind: 'webkit',
+      owner: peer.owner,
+      instanceId: peer.instanceId,
+      connectedAt: this.registry.nextConnectedAt(),
+      engine: peer.engine,
+      focus: peer.focus,
+      profile: peer.profile,
+      driver: peer.driver,
+      limitations: peer.limitations,
+      toolSupport: peer.toolSupport,
+      ws,
+    })
+    console.error(`Webster: webkit peer v${peer.version} (${peer.browser}) connected, id=${id}, ownerFp=${ownerFingerprint(peer.owner)}`)
+  }
+
+  /** The registered webkit peer on this connection, or undefined for anything else. */
+  private peerOn(ws: unknown): ConnectedBrowser | undefined {
+    const b = this.registry.findByWs(ws)
+    return b?.kind === 'webkit' ? b : undefined
+  }
+
+  private handlePeerState(ws: unknown, msg: Parameters<typeof validatePeerState>[0]) {
+    const peer = this.peerOn(ws)
+    if (!peer) return
+    const parsed = validatePeerState(msg)
+    if (!parsed.ok) {
+      console.error(`Webster: ignored invalid peer_state (${parsed.reason})`)
+      return
+    }
+    Object.assign(peer, parsed.value)
+  }
+
+  private handleSelectForOwner(ws: unknown) {
+    const peer = this.peerOn(ws)
+    if (peer) this.registry.pinPeerForOwner(peer)
+  }
+
+  private handleUnregister(ws: unknown, rawReason: unknown) {
+    const peer = this.peerOn(ws)
+    if (!peer) return
+    const reason = sanitizeReason(rawReason)
+
+    this.registry.unregisterPeer(peer, reason)
+    this.rejectPendingFor(peer, reason)
+    console.error(`Webster: webkit peer unregistered, id=${peer.id}`)
+  }
+
   private handleClose(ws: unknown) {
-    const ext = [...this.extensions.values()].find((e) => e.ws === ws)
+    const ext = this.registry.findByWs(ws)
     if (!ext) return
 
-    this.extensions.delete(ext.id)
-    if (this.activeExtensionId === ext.id) {
-      this.activeExtensionId = this.extensions.size > 0 ? this.extensions.keys().next().value! : null
-    }
-    console.error(`Webster: extension disconnected (${ext.browser}), id=${ext.id}`)
-    this.rejectPendingOnDisconnect()
+    this.removeBrowser(ext)
+    console.error(`Webster: ${ext.kind === 'webkit' ? 'webkit peer' : 'extension'} disconnected (${ext.browser}), id=${ext.id}`)
   }
 
-  private getActiveExtension(): ConnectedExtension {
-    if (this.extensions.size === 0) {
-      throw new Error('Extension not connected')
-    }
-    if (this.activeExtensionId !== null) {
-      const ext = this.extensions.get(this.activeExtensionId)
-      if (ext) return ext
-    }
-    if (this.extensions.size === 1) {
-      return this.extensions.values().next().value!
-    }
-    throw new Error('Multiple browsers connected — use set_browser to choose')
+  private defaultBrowser(): ConnectedBrowser {
+    const def = this.registry.serverDefault()
+    if (!def) throw new Error('Extension not connected')
+    return def
   }
 
-  getBrowsers(): Array<{ id: string; browser: string; version: string; transport: string; active: boolean }> {
-    return [...this.extensions.values()].map((ext) => ({
-      id: ext.id,
-      browser: ext.browser,
-      version: ext.version,
-      transport: ext.transport,
-      active: ext.id === this.activeExtensionId,
-    }))
-  }
-
-  setBrowser(idOrBrowserName: string): { id: string; browser: string; version: string; transport: string; active: boolean } {
-    // Try exact id match first, then browser name match
-    let found: ConnectedExtension | undefined =
-      this.extensions.get(idOrBrowserName) ??
-      [...this.extensions.values()].find((e) => e.browser === idOrBrowserName)
-
-    if (!found) {
-      throw new Error(`No connected extension matching '${idOrBrowserName}'`)
-    }
-
-    this.activeExtensionId = found.id
-    return {
-      id: found.id,
-      browser: found.browser,
-      version: found.version,
-      transport: found.transport,
-      active: true,
-    }
-  }
-
-  dispatch(command: Omit<WsCommand, 'id'>, timeoutMs?: number): Promise<unknown> {
-    let ext: ConnectedExtension
-    try {
-      ext = this.getActiveExtension()
-    } catch (err) {
-      return Promise.reject(err)
-    }
-
+  private sendTo(ext: ConnectedBrowser, command: Omit<WsCommand, 'id'>, timeoutMs?: number): Promise<unknown> {
     const id = crypto.randomUUID() as string
     const msg: WsCommand = { id, ...command } as WsCommand
     const timeout = timeoutMs ?? this.commandTimeout
@@ -507,7 +739,7 @@ export class WebsterServer {
         reject(new Error(`Command timed out after ${Math.round(timeout / 1000)}s`))
       }, timeout)
 
-      this.pending.set(id, { resolve, reject, timeoutHandle })
+      this.pending.set(id, { resolve, reject, timeoutHandle, browserId: ext.id })
 
       if (ext.transport === 'ws') {
         ext.ws!.send(JSON.stringify(msg))
@@ -525,68 +757,9 @@ export class WebsterServer {
     })
   }
 
-  isConnected(): boolean {
-    return this.extensions.size > 0
-  }
-
-  // ─── Registry ────────────────────────────────────────────────────────────
-
-  registerSelf(): void {
-    const alive = readRegistry().filter(e => isProcessAlive(e.pid))
-    alive.push({ port: this.port, pid: process.pid, started: new Date().toISOString() })
-    writeRegistry(alive)
-  }
-
-  deregisterSelf(): void {
-    const remaining = readRegistry().filter(e => !(e.port === this.port && e.pid === process.pid))
-    writeRegistry(remaining)
-  }
-
-  // ─── Tab ownership ───────────────────────────────────────────────────────
-
-  claimTab(tabId: number | undefined): { claimed: boolean; tabId: number | null; owner: string } {
-    if (tabId == null) {
-      return { claimed: false, tabId: null, owner: '', }
-    }
-    const owner = `${this.port}:${process.pid}`
-    this.tabOwnership.set(tabId, owner)
-    return { claimed: true, tabId, owner }
-  }
-
-  releaseTab(tabId: number | undefined): void {
-    if (tabId != null) this.tabOwnership.delete(tabId)
-  }
-
-  getClaimedTabs(): Array<{ tabId: number; owner: string }> {
-    return [...this.tabOwnership.entries()].map(([tabId, owner]) => ({ tabId, owner }))
-  }
-
-  // ─── Capture session management ───────────────────────────────────────
-
-  startCaptureSession(config: CaptureConfig): CaptureSession {
-    // Stop any existing session
-    if (this.captureSession?.active) {
-      this.captureSession.finalize()
-    }
-    const id = crypto.randomUUID() as string
-    this.captureSession = new CaptureSession(id, config)
-    return this.captureSession
-  }
-
-  getCaptureSession(): CaptureSession | null {
-    return this.captureSession
-  }
-
-  stopCaptureSession(): CaptureSession | null {
-    const session = this.captureSession
-    if (session?.active) {
-      session.finalize()
-    }
-    return session
-  }
-
-  private handleCaptureEvent(msg: WsCaptureEvent | WsCaptureDone | WsCaptureBody): void {
+  private handleCaptureEvent(msg: WsCaptureEvent | WsCaptureDone | WsCaptureBody, senderOwner: string | null): void {
     if (!this.captureSession?.active) return
+    if (senderOwner !== this.captureOwner) return
 
     if (isCaptureEvent(msg)) {
       if (msg.kind === 'frame') {
@@ -616,13 +789,6 @@ export class WebsterServer {
     } else if (isCaptureDone(msg)) {
       this.captureSession.finalize()
     }
-  }
-
-  // ─── Retention ────────────────────────────────────────────────────────
-
-  /** True while a retention sweep timer is armed. Off unless opted in. */
-  get retentionEnabled(): boolean {
-    return this.retentionTimer !== null
   }
 
   /**
@@ -673,17 +839,5 @@ export class WebsterServer {
       return tb - ta
     })
     return sessions
-  }
-
-  close(): void {
-    if (this.retentionTimer) {
-      clearInterval(this.retentionTimer)
-      this.retentionTimer = null
-    }
-    if (this.captureSession?.active) {
-      this.captureSession.finalize()
-    }
-    this.deregisterSelf()
-    this.server.stop(true)
   }
 }

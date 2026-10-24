@@ -29,7 +29,7 @@ Claude Code (HTTP MCP)
 ## Key Commands
 
 ```bash
-bun test                              # run tests (60 tests)
+bun test                              # run tests (399 tests)
 bun run typecheck                     # type check
 bun start                             # start MCP server manually
 ./scripts/build-extension.sh --all   # build extension for all browsers
@@ -42,8 +42,11 @@ bun start                             # start MCP server manually
 ```
 src/
   index.ts        # entry: MCP server + WebSocket startup
-  server.ts       # WebSocket server, HTTP API, dispatch, session management
-  tools.ts        # 40 MCP tool definitions
+  server.ts       # WebSocket server, HTTP API, per-session routing, session management
+  browser-registry.ts # connected browsers + per-session routing (resolve/peek/rebind)
+  net-guard.ts    # loopback / Host / Origin checks, owner token fingerprint
+  peer-validation.ts  # handshake + peer_state validation for native (webkit) peers
+  tools.ts        # 43 MCP tool definitions
   protocol.ts     # WsCommand / WsResult / push event types
   capture.ts      # CaptureSession — disk-backed event + frame storage
   video.ts        # Multi-format video encoder (mp4/webm/gif via ffmpeg)
@@ -160,9 +163,21 @@ Extension → Server:  { type: 'capture_done' }
 
 Commands time out after 30 seconds. Extension auto-reconnects with exponential backoff.
 
+## Per-session browser selection
+
+Each MCP session (one Claude Code process, plus its subagents) has its own
+browser binding: `set_browser` affects only the caller, a session's first
+command fixes its browser, and a browser that disappears is never silently
+replaced (`The selected browser is gone ...`; the same browser coming back is
+picked up). `X-Webster-Owner` on the `initialize` request scopes native browser
+peers (`kind: "webkit"`, e.g. the Nostromo pane) to one owner. Webster only
+accepts loopback connections, expected `Host` headers, and non-web-page
+`Origin`s. Full contract, error texts and threat model:
+[docs/browser-peers.md](docs/browser-peers.md).
+
 ## Tool Conventions
 
-- All 40 tools use `snake_case` names matching the `mcp__webster__*` pattern
+- All 43 tools use `snake_case` names matching the `mcp__webster__*` pattern
 - Every tool accepts an optional `tabId` — defaults to the active tab
 - Tools return the raw data on success; errors surface as MCP error responses
 - Capture tools (`start_capture`, `stop_capture`, `get_capture`) read from server-side disk storage — no extension round-trip
@@ -170,10 +185,10 @@ Commands time out after 30 seconds. Extension auto-reconnects with exponential b
 
 ## Testing
 
-Tests use real WebSocket connections against a live `WebsterServer` instance on a random port. No mocks. Video tests require ffmpeg and are skipped in CI when unavailable.
+Tests use real WebSocket connections against a live `WebsterServer` instance on a random port. No mocks. Video tests require ffmpeg and are skipped in CI when unavailable. Never bind port 3456 in a test — the live server may be running there. GitHub Actions (`.github/workflows/ci.yml`) runs `bun install --frozen-lockfile`, `bun test` and `bun run typecheck` on every PR.
 
 ```bash
-bun test                    # all tests (60)
+bun test                    # all tests (399)
 bun test --watch            # watch mode
 bun test src/__tests__/server.test.ts   # one file
 ```
@@ -212,6 +227,7 @@ cd menubar && swift build && .build/debug/WebsterMenu
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WEBSTER_PORT` | `3456` | Port for WebSocket, MCP HTTP, dashboard, and replay viewer |
+| `WEBSTER_ALLOW_NON_LOOPBACK` | unset | Set to `1` to disable the loopback-address and `Host` checks on every route. Webkit peer registration stays loopback-only regardless. Off by default |
 | `WEBSTER_RETENTION_HOURS` | `24` | Age at which a capture becomes eligible for deletion (plus a 24h grace notice). `0` disables deletion — retain indefinitely |
 
 ## Hard Rules

@@ -1,5 +1,5 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js'
-import type { WebsterServer } from './server.js'
+import type { WebsterServer, SessionContext } from './server.js'
 import type { VideoFormat } from './video.js'
 import type { CaptureEventKind } from './protocol.js'
 import { redactSessionDir, readSessionEvents, parseCaptureConfig, CAPTURES_DIR, type CaptureEvent } from './capture.js'
@@ -12,9 +12,9 @@ interface WebsterTool extends Tool {
   execute(input: Record<string, unknown>): Promise<unknown>
 }
 
-export function createTools(server: WebsterServer): WebsterTool[] {
+export function createTools(server: WebsterServer, ctx?: SessionContext): WebsterTool[] {
   function dispatch(action: string, params: Record<string, unknown> = {}, timeoutMs?: number): Promise<unknown> {
-    return server.dispatch({ action, ...params }, timeoutMs)
+    return server.dispatch({ action, ...params }, timeoutMs, ctx)
   }
 
   const CAPTURE_TIMEOUT = 60000 // 60s — capture setup touches every tab
@@ -480,7 +480,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
       },
       execute: async (input) => {
         // Create server-side session BEFORE telling the extension to start
-        const session = server.startCaptureSession(parseCaptureConfig(input))
+        const session = server.startCaptureSession(parseCaptureConfig(input), ctx)
 
         // Tell extension to start capture + streaming
         let reply: Record<string, unknown> | undefined
@@ -510,13 +510,19 @@ export function createTools(server: WebsterServer): WebsterTool[] {
         properties: {},
       },
       execute: async () => {
-        // Tell extension to stop (lightweight — no data returned)
-        await dispatch('stopCapture', {}, CAPTURE_TIMEOUT)
+        // Tell extension to stop (lightweight — no data returned). If the browser
+        // is gone, still finalize the server-side session and say so.
+        let warning: string | undefined
+        try {
+          await dispatch('stopCapture', {}, CAPTURE_TIMEOUT)
+        } catch (e) {
+          warning = `Could not tell the browser to stop capturing: ${e instanceof Error ? e.message : String(e)}`
+        }
 
         // Finalize server-side session
         const session = server.stopCaptureSession()
         if (!session) throw new Error('No active capture session')
-        return session.getSnapshot()
+        return warning ? { ...session.getSnapshot(), warning } : session.getSnapshot()
       },
     },
 
@@ -846,14 +852,14 @@ export function createTools(server: WebsterServer): WebsterTool[] {
 
     {
       name: 'get_browsers',
-      description: 'List all connected browser extensions. Use this to see which browsers are available before using set_browser.',
+      description: 'List the browsers available to this session, with `active` marking the one this session\'s next command would reach. Includes `kind` ("extension" or "webkit") and `engine`; a Nostromo browser pane that belongs to this session\'s focus also shows its focus, profile, driver and limitations. Use this to see which browsers are available before using set_browser, and after a "selected browser is gone" error.',
       inputSchema: { type: 'object', properties: {} },
-      execute: () => Promise.resolve(server.getBrowsers()),
+      execute: () => Promise.resolve(server.getBrowsers(ctx)),
     },
 
     {
       name: 'set_browser',
-      description: 'Set the active browser target for all subsequent commands. Use get_browsers first to see available options.',
+      description: 'Set the browser target for this session only (other sessions are not affected). Until you call it, this session uses the first browser it commands and sticks with it. If that browser disconnects and does not come back, commands fail with "The selected browser is gone" until you call set_browser again. Use get_browsers first to see available options.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -861,7 +867,7 @@ export function createTools(server: WebsterServer): WebsterTool[] {
         },
         required: ['browser'],
       },
-      execute: (input) => Promise.resolve(server.setBrowser(input.browser as string)),
+      execute: (input) => Promise.resolve(server.setBrowser(input.browser as string, ctx as SessionContext)),
     },
   ]
 }
