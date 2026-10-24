@@ -76,6 +76,9 @@ type ExtServer = Bun.Server<any>
 /** A WebSocket that has not registered as a browser within this long is closed. */
 const HANDSHAKE_TIMEOUT_MS = 10_000
 
+/** The name native peers must use; extensions may not claim it. */
+const RESERVED_PEER_NAME = 'nostromo'
+
 export class WebsterServer {
   private registry = new BrowserRegistry()
   private pending = new Map<string, PendingCommand>()
@@ -318,6 +321,7 @@ export class WebsterServer {
         return Response.json({ error: 'Only extensions can register over HTTP' }, { status: 400 })
       }
       const browserName = typeof body.browser === 'string' ? body.browser : 'unknown'
+      if (browserName === RESERVED_PEER_NAME) return Response.json({ error: `'${RESERVED_PEER_NAME}' is reserved for native peers` }, { status: 400 })
       // Evict any stale HTTP connections for the same browser (SW restart without clean disconnect)
       for (const existing of this.registry.all()) {
         if (existing.transport === 'http' && existing.browser === browserName) {
@@ -634,6 +638,12 @@ export class WebsterServer {
     }
     if (kind !== 'extension') {
       console.error('Webster: ignoring handshake with unknown kind')
+      return
+    }
+
+    if (msg.browser === RESERVED_PEER_NAME) {
+      console.error('Webster: refused extension handshake using the reserved peer name')
+      ;(ws as { close(code?: number, reason?: string): void }).close(1008, 'reserved browser name')
       return
     }
 

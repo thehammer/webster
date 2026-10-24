@@ -140,7 +140,7 @@ recognised by the presence of `id`. Webkit peers are WebSocket-only; HTTP
 
 | Field | Rule |
 |---|---|
-| `browser` | must be `nostromo` (default); any other name is refused so a peer cannot squat an extension's name |
+| `browser` | must be `nostromo` (default); any other name is refused so a peer cannot squat an extension's name. Extensions in turn cannot register as `nostromo` (WS handshake closed 1008, `POST /connect` 400) |
 | `instanceId` | `^[A-Za-z0-9_-]{8,128}$`, required, stable per pane |
 | `owner` | the D1 token format, required |
 | `engine` | `^[a-z0-9-]{1,32}$`, default `webkit` |

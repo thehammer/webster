@@ -347,6 +347,15 @@ describe('registration refusals (BP0-11)', () => {
     })
   }
 
+  test('an extension cannot register under the reserved peer name nostromo (WS and HTTP)', async () => {
+    const raw = await rawSocket(rig.port)
+    raw.send({ type: 'connected', browser: 'nostromo', version: '1' })
+    expect((await closedWithin(raw, 1500))?.code).toBe(1008)
+    const res = await rawHttp(rig.port, { method: 'POST', path: '/connect', headers: { 'Content-Type': 'application/json' }, body: '{"browser":"nostromo"}' })
+    expect(res.status).toBe(400)
+    expect((await getStatus(rig.port)).extensions).toEqual([])
+  })
+
   test('refuses with 1008 when the upgrade carries an Origin header, even an extension origin', async () => {
     const peer = await connectFakePeer(rig.port, { owner: T, headers: { Origin: 'chrome-extension://abcdef' }, awaitRegistration: false })
     const info = await closedWithin(peer, 1500)
