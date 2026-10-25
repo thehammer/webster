@@ -56,10 +56,36 @@ export function buildMcpServer(wsServer: WebsterServer, ctx?: SessionContext): S
   return mcpServer
 }
 
+/** Sessions idle longer than this (no request, no open stream) are expired. */
+const DEFAULT_SESSION_IDLE_HOURS = 6
+/** How often the manager looks for expired sessions once started. */
+const SESSION_SWEEP_INTERVAL_MS = 10 * 60 * 1000
+
+export interface McpSessionManagerOptions {
+  /** Idle bound in ms; 0 disables expiry. Default: WEBSTER_SESSION_IDLE_HOURS (6). */
+  idleTimeoutMs?: number
+  /** Clock, for tests. */
+  now?: () => number
+}
+
+function defaultIdleTimeoutMs(): number {
+  const raw = process.env.WEBSTER_SESSION_IDLE_HOURS
+  const hours = raw === undefined || raw.trim() === '' ? NaN : Number(raw)
+  return (Number.isFinite(hours) && hours >= 0 ? hours : DEFAULT_SESSION_IDLE_HOURS) * 60 * 60 * 1000
+}
+
 export class McpSessionManager {
   private sessions = new Map<string, WebStandardStreamableHTTPServerTransport>()
+  // Per-session liveness. `busy` counts in-flight requests plus open SSE streams.
+  private activity = new Map<string, { lastSeen: number; busy: number }>()
+  private idleTimeoutMs: number
+  private now: () => number
+  private sweepTimer: ReturnType<typeof setInterval> | null = null
 
-  constructor(private wsServer: WebsterServer) {}
+  constructor(private wsServer: WebsterServer, options: McpSessionManagerOptions = {}) {
+    this.idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs()
+    this.now = options.now ?? Date.now
+  }
 
   get sessionCount(): number {
     return this.sessions.size
@@ -69,13 +95,46 @@ export class McpSessionManager {
     return [...this.sessions.keys()]
   }
 
+  /** Begin the periodic idle sweep. Opt-in, like the capture retention sweep; never holds the process open. */
+  start(): void {
+    if (this.sweepTimer || this.idleTimeoutMs <= 0) return
+    this.sweepTimer = setInterval(() => this.sweepIdle(), SESSION_SWEEP_INTERVAL_MS)
+    this.sweepTimer.unref?.()
+  }
+
+  stop(): void {
+    if (this.sweepTimer) clearInterval(this.sweepTimer)
+    this.sweepTimer = null
+  }
+
+  /**
+   * Expire sessions that have been idle past the bound. A client that crashes
+   * without a DELETE never closes its transport, so nothing else would ever
+   * release its context. A session with an in-flight request or an open SSE
+   * stream is never expired. Returns the ids it expired.
+   */
+  sweepIdle(): string[] {
+    if (this.idleTimeoutMs <= 0) return []
+    const cutoff = this.now() - this.idleTimeoutMs
+    const expired: string[] = []
+    for (const [id, transport] of [...this.sessions]) {
+      const a = this.activity.get(id)
+      if (a && (a.busy > 0 || a.lastSeen > cutoff)) continue
+      this.forget(id)
+      expired.push(id)
+      console.error(`Webster: MCP session expired after idling id=${id} (${this.sessions.size} active)`)
+      transport.close().catch(() => { /* already closed */ })
+    }
+    return expired
+  }
+
   async handleRequest(req: Request): Promise<Response> {
     const sessionId = req.headers.get('mcp-session-id')
 
     if (sessionId) {
       const existing = this.sessions.get(sessionId)
       if (!existing) return Response.json({ error: 'Session not found' }, { status: 404 })
-      return existing.handleRequest(req)
+      return this.track(sessionId, () => existing.handleRequest(req))
     }
 
     // No session ID — create new session. The owner is read once, from this
@@ -95,20 +154,92 @@ export class McpSessionManager {
       sessionIdGenerator: () => crypto.randomUUID() as string,
       onsessioninitialized: (id) => {
         this.sessions.set(id, transport)
+        this.activity.set(id, { lastSeen: this.now(), busy: 0 })
         ctx.id = id
         this.wsServer.registerSession(ctx)
         const ownerNote = owner ? ` ownerFp=${ownerFingerprint(owner)}` : ''
         console.error(`Webster: MCP session started id=${id}${ownerNote} (${this.sessions.size} active)`)
       },
       onsessionclosed: (id) => {
-        this.sessions.delete(id)
-        this.wsServer.forgetSession(id)
+        this.forget(id)
         console.error(`Webster: MCP session closed id=${id} (${this.sessions.size} active)`)
       },
     })
 
+    // Sessions whose transport is closed without a DELETE must not leak their context.
+    transport.onclose = () => {
+      if (transport.sessionId) this.forget(transport.sessionId)
+    }
+
     const server = buildMcpServer(this.wsServer, ctx)
     await server.connect(transport)
     return transport.handleRequest(req)
+  }
+
+  private forget(id: string): void {
+    this.sessions.delete(id)
+    this.activity.delete(id)
+    this.wsServer.forgetSession(id)
+  }
+
+  /**
+   * Run one request for a session. The session counts as busy until the whole
+   * response is delivered: an SSE body outlives handleRequest(), so a streamed
+   * reply (or an idle GET stream) keeps the session alive until it ends.
+   */
+  private async track(id: string, run: () => Promise<Response>): Promise<Response> {
+    const a = this.activity.get(id)
+    if (!a) return run()
+    a.busy++
+    a.lastSeen = this.now()
+    let handedOff = false
+    try {
+      const res = await run()
+      const streamed = this.trackStream(a, res)
+      handedOff = streamed !== res
+      return streamed
+    } finally {
+      if (!handedOff) this.release(a)
+    }
+  }
+
+  /** Wrap an SSE response so its busy count is held until the stream ends or the client drops it. */
+  private trackStream(a: { lastSeen: number; busy: number }, res: Response): Response {
+    if (!res.body || !(res.headers.get('content-type') ?? '').includes('text/event-stream')) return res
+    const reader = res.body.getReader()
+    const now = this.now
+    let released = false
+    const finish = () => {
+      if (released) return
+      released = true
+      this.release(a)
+    }
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const { done, value } = await reader.read()
+          if (done) {
+            finish()
+            controller.close()
+            return
+          }
+          a.lastSeen = now() // SSE activity keeps the session alive
+          controller.enqueue(value)
+        } catch (err) {
+          finish()
+          controller.error(err)
+        }
+      },
+      cancel(reason) {
+        finish()
+        return reader.cancel(reason)
+      },
+    })
+    return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers })
+  }
+
+  private release(a: { lastSeen: number; busy: number }): void {
+    a.busy--
+    a.lastSeen = this.now()
   }
 }

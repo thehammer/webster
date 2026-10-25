@@ -347,6 +347,15 @@ describe('registration refusals (BP0-11)', () => {
     })
   }
 
+  test('an extension cannot register under the reserved peer name nostromo (WS and HTTP)', async () => {
+    const raw = await rawSocket(rig.port)
+    raw.send({ type: 'connected', browser: 'nostromo', version: '1' })
+    expect((await closedWithin(raw, 1500))?.code).toBe(1008)
+    const res = await rawHttp(rig.port, { method: 'POST', path: '/connect', headers: { 'Content-Type': 'application/json' }, body: '{"browser":"nostromo"}' })
+    expect(res.status).toBe(400)
+    expect((await getStatus(rig.port)).extensions).toEqual([])
+  })
+
   test('refuses with 1008 when the upgrade carries an Origin header, even an extension origin', async () => {
     const peer = await connectFakePeer(rig.port, { owner: T, headers: { Origin: 'chrome-extension://abcdef' }, awaitRegistration: false })
     const info = await closedWithin(peer, 1500)
@@ -433,7 +442,7 @@ describe('registration refusals (BP0-11)', () => {
   })
 
   test('an unknown message type is never treated as a handshake', async () => {
-    const raw = await rawSocket(rig.port)
+    const raw = await rawSocket(rig.port, { Origin: 'chrome-extension://abcdefghijklmnopabcdefghijklmnop' })
     raw.send({ type: 'hello_world', version: '1.0', browser: 'chrome' })
     raw.send({ type: 'registration', kind: 'webkit', version: '1', browser: 'nostromo', instanceId: newInstanceId(), owner: T, engine: 'webkit', focus: { tag: 'a', name: 'b' }, profile: 'p', driver: 'agent', limitations: [] })
     await sleep(100)
@@ -573,4 +582,41 @@ describe('peer helper sanity', () => {
     expect((await getStatus(rig.port)).ownedBrowserCount).toBe(1)
     expect(await closedWithin(peer, 50)).toBeNull()
   })
+})
+
+describe('webkit peers cannot take an extension browser\'s name (WF-2)', () => {
+  test('a handshake claiming browser "chrome" is refused with 1008 and not registered', async () => {
+    const before = await getStatus(rig.port)
+    const peer = await connectFakePeer(rig.port, { owner: T, browser: 'chrome', awaitRegistration: false })
+    const closed = await closedWithin(peer, 1500)
+    expect(closed?.code).toBe(1008)
+    const after = await getStatus(rig.port)
+    expect(after.ownedBrowserCount ?? 0).toBe(before.ownedBrowserCount ?? 0)
+    expect(after.extensions.length).toBe(before.extensions.length)
+  })
+
+  test('browser "nostromo" and an omitted browser are both accepted', async () => {
+    const a = await connectFakePeer(rig.port, { owner: T, browser: 'nostromo' })
+    const b = await connectFakePeer(rig.port, { owner: T, overrides: { browser: undefined } })
+    expect(await closedWithin(a, 150)).toBeNull()
+    expect(await closedWithin(b, 150)).toBeNull()
+    const s = await mcpSession(rig.port, T)
+    expect((await s.browsers()).filter((e) => e.kind === 'webkit').map((e) => e.browser)).toEqual(['nostromo', 'nostromo'])
+  })
+
+  for (const peerFirst of [true, false]) {
+    test(`set_browser("chrome") reaches the real extension, never the owner's peer (${peerFirst ? 'peer' : 'extension'} connected first)`, async () => {
+      let peer!: FakePeer
+      if (peerFirst) peer = await connectFakePeer(rig.port, { owner: T })
+      const chrome = await connectFakeExtension(rig.port, 'chrome')
+      if (!peerFirst) peer = await connectFakePeer(rig.port, { owner: T })
+      const s = await mcpSession(rig.port, T)
+
+      expect((await s.callTool('set_browser', { browser: 'chrome' })).isError).toBe(false)
+      const r = await s.callTool('get_tabs')
+      expect(r.json.by).toBe('chrome')
+      expect(chrome.actions()).toEqual(['getTabs'])
+      expect(peer.received).toEqual([])
+    })
+  }
 })

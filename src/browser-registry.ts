@@ -24,6 +24,12 @@ export interface ConnectedBrowser {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ws?: any
   pollResolve?: ((cmd: WsCommand) => void) | null
+  /** HTTP transport only: the per-registration secret /poll, /result and DELETE /connect must present. Never exposed. */
+  httpToken?: string
+  /** HTTP transport only: registered by an extension-scheme Origin without a token (old build), so that Origin alone authenticates it. */
+  originAuth?: boolean
+  /** HTTP transport only: last time the registration connected, polled or posted. */
+  lastSeen?: number
 }
 
 /** What a session is currently pointed at. See docs/browser-peers.md (D2). */
@@ -236,15 +242,24 @@ export class BrowserRegistry {
   select(idOrBrowserName: string, ctx: SessionContext): BrowserInfo {
     if (!ctx) throw new Error('set_browser needs a session')
     const visible = this.all().filter((b) => this.isVisible(b, ctx))
-    // Try exact id match first, then browser name match. Invisible browsers never match,
-    // so a pane's existence doesn't leak to other focuses.
-    const found = visible.find((b) => b.id === idOrBrowserName) ?? visible.find((b) => b.browser === idOrBrowserName)
+    // An exact id match wins. Otherwise a browser name: extensions beat native peers, and a name
+    // shared by several extensions is refused rather than routed to whichever connected first
+    // (or last). Invisible browsers never match, so a pane's existence doesn't leak to other focuses.
+    let found = visible.find((b) => b.id === idOrBrowserName)
+    if (!found) {
+      const extensions = visible.filter((b) => b.kind !== 'webkit' && b.browser === idOrBrowserName)
+      if (extensions.length > 1) {
+        throw new Error(`'${idOrBrowserName}' is ambiguous: ${extensions.length} connected extensions share that name; select one by id (see get_browsers)`)
+      }
+      found = extensions[0] ?? visible.find((b) => b.browser === idOrBrowserName)
+    }
     if (!found) {
       throw new Error(`No connected extension matching '${idOrBrowserName}'`)
     }
 
-    ctx.binding = this.makeBinding(found, 'explicit')
-    return this.list(ctx).find((b) => b.id === found.id)!
+    const target = found
+    ctx.binding = this.makeBinding(target, 'explicit')
+    return this.list(ctx).find((b) => b.id === target.id)!
   }
 
   // ─── Internals ─────────────────────────────────────────────────────────

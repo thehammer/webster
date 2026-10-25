@@ -17,6 +17,7 @@ const wsServer = new WebsterServer(PORT, undefined, { retention: maxAgeMs > 0 ? 
 wsServer.registerSelf()
 
 const sessionManager = new McpSessionManager(wsServer)
+sessionManager.start() // expire sessions whose client vanished without a DELETE
 wsServer.setMcpHandler((req) => sessionManager.handleRequest(req))
 
 console.error(`Webster MCP server started (ws://localhost:${PORT}, http://localhost:${PORT}/mcp)`)

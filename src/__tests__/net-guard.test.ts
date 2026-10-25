@@ -4,6 +4,7 @@
  */
 import { describe, test, expect, afterEach } from 'bun:test'
 import { createHash } from 'crypto'
+import { networkInterfaces } from 'os'
 import { isLoopbackAddress, isAllowedHost, isWebPageOrigin, ownerFingerprint } from '../net-guard.js'
 import {
   startRig, rawHttp, upgradeHeaders, rawSocket, connectFakePeer, getStatus, closedWithin,
@@ -200,5 +201,22 @@ describe('HTTP guard', () => {
       const res = await rawHttp(rig.port, { method: 'POST', path: '/connect', headers: { Origin: 'https://evil.example', 'Content-Type': 'application/json' }, body: '{}' })
       expect(res.status).toBe(403)
     })
+  })
+})
+
+describe('non-loopback peers are refused (WF-3)', () => {
+  const lan = Object.values(networkInterfaces()).flat()
+    .find((i) => i && !i.internal && i.family === 'IPv4')?.address
+  let rig: Rig | null = null
+  afterEach(() => { rig?.close(); rig = null })
+
+  test('a connection from a non-loopback address is refused with 403 even with a localhost Host header', async () => {
+    if (!lan) {
+      console.warn('SKIP WF-3: no non-loopback IPv4 interface on this machine')
+      return
+    }
+    rig = await startRig()
+    const res = await rawHttp(rig.port, { path: '/api/status', connectHost: lan, headers: { Host: `localhost:${rig.port}` } })
+    expect(res.status).toBe(403)
   })
 })
