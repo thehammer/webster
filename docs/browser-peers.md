@@ -237,9 +237,11 @@ rely on one. It is bound by a per-registration token instead:
   stored token, which replaces its own registration, or it waits out the 60 s.
   A stale registration is replaced.
 - **Old builds.** A client that registers with an extension-scheme `Origin` and no
-  token is treated as before: it evicts a same-name HTTP registration, and its
-  later `/poll`, `/result` and `DELETE` are accepted on that `Origin` alone (it
-  never learns to send the token).
+  token is treated as before: it replaces a same-name HTTP registration that is
+  stale or was itself registered on an `Origin`, and its later `/poll`, `/result`
+  and `DELETE` are accepted on that `Origin` alone (it never learns to send the
+  token). An `Origin` header alone never displaces a live registration held by a
+  token (`409`), and never opens one for `/poll`, `/result` or `DELETE`.
 
 What the HTTP door does **not** cover: with no `Origin` and no secret on the first
 `/connect`, nothing tells a stranger from the real Safari except the name. A

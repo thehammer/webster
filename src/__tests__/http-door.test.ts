@@ -302,6 +302,16 @@ describe('registering over HTTP with an extension-scheme Origin (legacy behaviou
     expect((await s.callTool('get_tabs')).isError).toBe(false)
     expect(chrome.actions()).toEqual(['getTabs'])
   })
+
+  test('an Origin header alone does not displace a live registration held by a token (409, holder untouched)', async () => {
+    const real = await register('safari') // no Origin: credentialed by its token only
+    const c = await connect({ browser: 'safari' }, { origin: SAFARI_ORIGIN })
+    expect(c.status, c.raw).toBe(409)
+    expect(await listed(real.id)).toBeDefined()
+    expect((await del(real.id, { origin: SAFARI_ORIGIN })).status).toBe(403)
+    expect(await listed(real.id)).toBeDefined()
+    expect((await entriesNamed('safari')).map((e) => e.id)).toEqual([real.id])
+  })
 })
 
 // ═════════════════════════════════════════════════════════════════════════════

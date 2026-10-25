@@ -357,11 +357,15 @@ export class WebsterServer {
         // The same extension reconnecting with its own token (service-worker restart): replace it.
         this.removeBrowser(own)
       } else if (extOrigin) {
-        // Old builds hold no token; their extension-scheme Origin is the credential. Evict stale
-        // HTTP connections for the same browser (SW restart without clean disconnect).
-        for (const existing of this.registry.all()) {
-          if (existing.transport === 'http' && existing.browser === browserName) this.removeBrowser(existing)
+        // Old builds hold no token; their extension-scheme Origin is the credential. They replace
+        // stale or Origin-credentialed HTTP connections for the same browser (SW restart without
+        // clean disconnect), but an Origin header alone never displaces a live registration that
+        // is held by a token.
+        const holders = this.registry.all().filter((b) => b.transport === 'http' && b.browser === browserName)
+        if (holders.some((b) => !b.originAuth && this.isLive(b))) {
+          return Response.json({ error: `'${browserName}' is already connected` }, { status: 409 })
         }
+        for (const existing of holders) this.removeBrowser(existing)
       } else {
         // No Origin and no matching token: this is the only way a stranger can look like Safari, so it
         // may only be Safari, and it may never displace or share the name with a live registration.
