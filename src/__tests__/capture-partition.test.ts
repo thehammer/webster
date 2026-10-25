@@ -78,8 +78,13 @@ describe('capture started on an extension (unowned)', () => {
     chrome.setReply('startCapture', { tabsAttached: 1 })
     await startOn(await mcpSession(rig.port))
 
+    // A push over /result counts only from a registered HTTP extension, identified by its token.
+    const reg = await fetch(`http://localhost:${rig.port}/connect`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ browser: 'safari', version: '17' }),
+    })
+    const { token: safariToken } = (await reg.json()) as { token: string }
     const res = await fetch(`http://localhost:${rig.port}/result`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(networkPush('https://http.example/push')),
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Webster-Token': safariToken }, body: JSON.stringify(networkPush('https://http.example/push')),
     })
     expect(res.status).toBe(204)
     await eventually(() => urls().includes('https://http.example/push'), { what: 'HTTP pushed event' })

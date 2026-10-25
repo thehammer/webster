@@ -242,22 +242,24 @@ describe('real browser shapes still register', () => {
       body: JSON.stringify({ browser: 'safari', version: '17.1' }),
     })
     expect(res.status).toBe(200)
-    const { id } = (await res.json()) as { id: string }
+    const { id, token } = (await res.json()) as { id: string; token: string }
     expect(id).toBeTruthy()
+    expect(token).toBeTruthy()
+    const auth = { 'X-Webster-Token': token }
 
     const listed = (await getStatus(rig.port)).extensions.find((e) => e.id === id)
     expect(listed).toMatchObject({ browser: 'safari', version: '17.1', transport: 'http' })
 
     const s = await mcpSession(rig.port)
     // The server only dispatches to an HTTP extension that is already polling.
-    const polling = fetch(`http://localhost:${rig.port}/poll?id=${id}`)
+    const polling = fetch(`http://localhost:${rig.port}/poll?id=${id}`, { headers: auth })
     await sleep(80)
     const call = s.callTool('get_tabs')
     const cmd = (await (await polling).json()) as { id: string; action: string }
     expect(cmd.action).toBe('getTabs')
     const posted = await fetch(`http://localhost:${rig.port}/result`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...auth },
       body: JSON.stringify({ id: cmd.id, success: true, data: [{ id: 7, title: 'safari tab' }] }),
     })
     expect(posted.status).toBe(204)
@@ -265,7 +267,7 @@ describe('real browser shapes still register', () => {
     expect(r.isError, r.text).toBe(false)
     expect(r.json).toEqual([{ id: 7, title: 'safari tab' }])
 
-    await fetch(`http://localhost:${rig.port}/connect?id=${id}`, { method: 'DELETE' })
+    await fetch(`http://localhost:${rig.port}/connect?id=${id}`, { method: 'DELETE', headers: auth })
   })
 })
 

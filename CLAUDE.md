@@ -174,7 +174,9 @@ peers (`kind: "webkit"`, e.g. the Nostromo pane) to one owner. Webster only
 accepts loopback connections, expected `Host` headers, and non-web-page
 `Origin`s. A WebSocket gets one handshake; as an extension it must carry a
 `chrome-extension://`-style `Origin` (no-Origin sockets can only register as native
-peers). Full contract, error texts and threat model:
+peers). Safari's HTTP door (`/connect`, `/poll`, `/result`) is bound by a
+per-registration `X-Webster-Token`, and without an extension `Origin` HTTP may only
+register as `safari`. Full contract, error texts and threat model:
 [docs/browser-peers.md](docs/browser-peers.md).
 
 ## Tool Conventions

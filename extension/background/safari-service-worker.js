@@ -13,6 +13,7 @@ let reconnectDelay = 1000
 let reconnectTimer = null
 let polling = false
 let extensionId = null // assigned by server on connect
+let httpToken = null // per-registration secret from /connect; sent as X-Webster-Token on every later request
 let lockRelease = null // releases the Web Lock when polling stops
 
 // Guard against browsers where webRequest isn't available (some Safari versions)
@@ -44,6 +45,17 @@ async function getPort() {
   return result.websterPort || DEFAULT_PORT
 }
 
+// The token survives service-worker restarts (storage.local), keyed by port: presenting it on
+// /connect lets this extension replace its own registration instead of being refused as a stranger.
+async function loadToken(port) {
+  const { websterHttpToken } = await chrome.storage.local.get('websterHttpToken')
+  return websterHttpToken?.port === port ? websterHttpToken.token : null
+}
+
+function authHeaders(extra = {}) {
+  return httpToken ? { ...extra, 'X-Webster-Token': httpToken } : extra
+}
+
 async function updateState(partial) {
   const result = await chrome.storage.local.get('websterState')
   const current = result.websterState || { connected: false, port: DEFAULT_PORT, commandsExecuted: 0, lastError: null }
@@ -71,15 +83,18 @@ async function connect() {
   const base = `http://localhost:${port}`
 
   try {
+    httpToken = await loadToken(port)
     const resp = await fetch(`${base}/connect`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ browser: 'safari', version: chrome.runtime.getManifest().version }),
       signal: AbortSignal.timeout(5000)
     })
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
     const data = await resp.json()
     extensionId = data.id
+    httpToken = data.token ?? null // an old server sends none
+    await chrome.storage.local.set({ websterHttpToken: { port, token: httpToken } })
     reconnectDelay = 1000
     await updateState({ connected: true, port, lastError: null })
   } catch (err) {
@@ -99,7 +114,7 @@ async function pollLoop(port, base) {
     while (true) {
       let command
       try {
-        const resp = await fetch(`${base}/poll?id=${extensionId}`, { signal: AbortSignal.timeout(28000) })
+        const resp = await fetch(`${base}/poll?id=${extensionId}`, { headers: authHeaders(), signal: AbortSignal.timeout(28000) })
         if (!resp.ok) throw new Error(`Poll HTTP ${resp.status}`)
         command = await resp.json()
       } catch (err) {
@@ -117,7 +132,7 @@ async function pollLoop(port, base) {
       try {
         await fetch(`${base}/result`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ id: command.id, success: result.success, data: result.data, error: result.error }),
           signal: AbortSignal.timeout(10000)
         })
@@ -152,7 +167,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       reconnectDelay = 1000
       // Disconnect from the server before reconnecting on the new port
       getPort().then((oldPort) => {
-        fetch(`http://localhost:${oldPort}/connect?id=${extensionId}`, { method: 'DELETE' }).catch(() => {})
+        fetch(`http://localhost:${oldPort}/connect?id=${extensionId}`, { method: 'DELETE', headers: authHeaders() }).catch(() => {})
       })
       connect()
       sendResponse({ ok: true })

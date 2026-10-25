@@ -24,6 +24,12 @@ export interface ConnectedBrowser {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ws?: any
   pollResolve?: ((cmd: WsCommand) => void) | null
+  /** HTTP transport only: the per-registration secret /poll, /result and DELETE /connect must present. Never exposed. */
+  httpToken?: string
+  /** HTTP transport only: registered by an extension-scheme Origin without a token (old build), so that Origin alone authenticates it. */
+  originAuth?: boolean
+  /** HTTP transport only: last time the registration connected, polled or posted. */
+  lastSeen?: number
 }
 
 /** What a session is currently pointed at. See docs/browser-peers.md (D2). */

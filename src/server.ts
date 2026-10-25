@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs'
 import { join } from 'path'
+import { randomBytes, timingSafeEqual } from 'crypto'
 import { homedir } from 'os'
 import {
   isResult, isCaptureEvent, isCaptureDone, isCaptureBody, isCapturePush,
@@ -79,6 +80,26 @@ const HANDSHAKE_TIMEOUT_MS = 10_000
 /** The name native peers must use; extensions may not claim it. */
 const RESERVED_PEER_NAME = 'nostromo'
 
+/** Header carrying the per-registration secret an HTTP extension must present on /poll, /result and DELETE /connect. */
+const HTTP_TOKEN_HEADER = 'x-webster-token'
+
+/**
+ * The only browser that may register over HTTP without an extension-scheme
+ * Origin. Safari's service worker long-polls (WebSockets are blocked there) and
+ * may send no Origin; Chrome, Edge and Firefox use the WebSocket door, which
+ * does require one. Any other name over HTTP needs an extension Origin.
+ */
+const HTTP_NO_ORIGIN_BROWSERS: ReadonlySet<string> = new Set(['safari'])
+
+/** An HTTP registration that has not connected, polled or posted for this long no longer holds its name. */
+const HTTP_LIVE_MS = 60_000
+
+function tokensEqual(a: string, b: string): boolean {
+  const x = Buffer.from(a)
+  const y = Buffer.from(b)
+  return x.length === y.length && timingSafeEqual(x, y)
+}
+
 export class WebsterServer {
   private registry = new BrowserRegistry()
   // Sockets that have completed a handshake. A socket gets exactly one — even
@@ -87,9 +108,6 @@ export class WebsterServer {
   private pending = new Map<string, PendingCommand>()
   private server: ExtServer
   private commandTimeout: number
-
-  // HTTP long-poll transport — result handlers indexed by command id
-  private httpResultHandlers = new Map<string, (result: WsMessage) => void>()
 
   // MCP HTTP handler — set by index.ts after session manager is created
   private mcpHandler: ((req: Request) => Promise<Response>) | null = null
@@ -110,10 +128,14 @@ export class WebsterServer {
   private retentionTimer: ReturnType<typeof setInterval> | null = null
   private retentionOptions: RetentionOptions | null = null
   private handshakeTimeoutMs: number
+  private httpLiveMs: number
+  // Pending handshake timers per socket, cleared when the socket closes or the server does.
+  private handshakeTimers = new Map<unknown, ReturnType<typeof setTimeout>>()
 
-  constructor(port: number, commandTimeout = 30000, options?: { retention?: boolean | RetentionOptions; handshakeTimeoutMs?: number }) {
+  constructor(port: number, commandTimeout = 30000, options?: { retention?: boolean | RetentionOptions; handshakeTimeoutMs?: number; httpLiveMs?: number }) {
     this.commandTimeout = commandTimeout
     this.handshakeTimeoutMs = options?.handshakeTimeoutMs ?? HANDSHAKE_TIMEOUT_MS
+    this.httpLiveMs = options?.httpLiveMs ?? HTTP_LIVE_MS
 
     if (options?.retention) {
       this.retentionOptions = options.retention === true ? {} : options.retention
@@ -261,6 +283,8 @@ export class WebsterServer {
       clearInterval(this.retentionTimer)
       this.retentionTimer = null
     }
+    for (const timer of this.handshakeTimers.values()) clearTimeout(timer)
+    this.handshakeTimers.clear()
     if (this.captureSession?.active) {
       this.captureSession.finalize()
     }
@@ -325,14 +349,36 @@ export class WebsterServer {
       }
       const browserName = typeof body.browser === 'string' ? body.browser : 'unknown'
       if (browserName === RESERVED_PEER_NAME) return Response.json({ error: `'${RESERVED_PEER_NAME}' is reserved for native peers` }, { status: 400 })
-      // Evict any stale HTTP connections for the same browser (SW restart without clean disconnect)
-      for (const existing of this.registry.all()) {
-        if (existing.transport === 'http' && existing.browser === browserName) {
-          this.removeBrowser(existing)
+
+      const extOrigin = isExtensionOrigin(req.headers.get('origin'))
+      const presented = req.headers.get(HTTP_TOKEN_HEADER)
+      const own = presented ? this.httpBrowserByToken(presented) : undefined
+      if (own && own.browser === browserName) {
+        // The same extension reconnecting with its own token (service-worker restart): replace it.
+        this.removeBrowser(own)
+      } else if (extOrigin) {
+        // Old builds hold no token; their extension-scheme Origin is the credential. Evict stale
+        // HTTP connections for the same browser (SW restart without clean disconnect).
+        for (const existing of this.registry.all()) {
+          if (existing.transport === 'http' && existing.browser === browserName) this.removeBrowser(existing)
+        }
+      } else {
+        // No Origin and no matching token: this is the only way a stranger can look like Safari, so it
+        // may only be Safari, and it may never displace or share the name with a live registration.
+        if (!HTTP_NO_ORIGIN_BROWSERS.has(browserName)) {
+          return Response.json({ error: `Registering as '${browserName}' over HTTP needs an extension Origin` }, { status: 403 })
+        }
+        const holders = this.registry.all().filter((b) => b.kind === 'extension' && b.browser === browserName)
+        if (holders.some((b) => this.isLive(b))) {
+          return Response.json({ error: `'${browserName}' is already connected` }, { status: 409 })
+        }
+        for (const stale of holders) {
+          if (stale.transport === 'http') this.removeBrowser(stale)
         }
       }
 
       const id = crypto.randomUUID() as string
+      const httpToken = randomBytes(32).toString('base64url')
       const ext: ConnectedBrowser = {
         id,
         browser: browserName,
@@ -344,16 +390,20 @@ export class WebsterServer {
         connectedAt: this.registry.nextConnectedAt(),
         engine: engineForExtension(browserName),
         pollResolve: null,
+        httpToken,
+        originAuth: extOrigin && !own,
+        lastSeen: Date.now(),
       }
       this.registry.add(ext)
       console.error(`Webster: extension v${ext.version} (${ext.browser}) connected (HTTP), id=${id}`)
-      return Response.json({ id })
+      return Response.json({ id, token: httpToken })
     }
 
     if (req.method === 'DELETE' && url.pathname === '/connect') {
       const id = url.searchParams.get('id') ?? null
       const ext = id ? this.registry.get(id) : undefined
       if (ext && ext.transport === 'http') {
+        if (!this.httpAuthorized(ext, req)) return new Response('Missing or wrong token', { status: 403 })
         this.removeBrowser(ext)
         console.error(`Webster: extension disconnected (HTTP), id=${id}`)
       }
@@ -366,30 +416,40 @@ export class WebsterServer {
       if (!ext || ext.transport !== 'http') {
         return new Response('Unknown extension id', { status: 404 })
       }
+      // The id is listed in /api/status, so it is not a credential: without the token a stranger
+      // could poll the registration and steal its commands.
+      if (!this.httpAuthorized(ext, req)) return new Response('Missing or wrong token', { status: 403 })
+      ext.lastSeen = Date.now()
 
       // Long-poll: hold the connection open until a command arrives or timeout
       return new Promise<Response>((resolve) => {
         const timer = setTimeout(() => {
           ext.pollResolve = null
+          ext.lastSeen = Date.now()
           resolve(Response.json({ type: 'keepalive' }))
         }, 25000)
 
         ext.pollResolve = (cmd: WsCommand) => {
           clearTimeout(timer)
           ext.pollResolve = null
+          ext.lastSeen = Date.now()
           resolve(Response.json(cmd))
         }
       })
     }
 
     if (req.method === 'POST' && url.pathname === '/result') {
+      // Only a registered HTTP extension may post: results and capture pushes alike.
+      const sender = this.httpSender(req)
+      if (!sender) return new Response('Missing or wrong token', { status: 403 })
       let body: WsMessage
       try {
         body = await req.json() as WsMessage
       } catch {
         return new Response('Bad JSON', { status: 400 })
       }
-      this.handleHttpResult(body)
+      sender.lastSeen = Date.now()
+      this.handleHttpResult(body, sender)
       return new Response(null, { status: 204 })
     }
 
@@ -514,34 +574,42 @@ export class WebsterServer {
     return new Response('Webster MCP server', { status: 200 })
   }
 
-  private handleHttpResult(msg: WsMessage) {
+  private handleHttpResult(msg: WsMessage, sender: ConnectedBrowser) {
     // Capture push events via HTTP (Safari path)
     if (isCapturePush(msg)) {
-      this.handleCaptureEvent(msg, null) // the HTTP transport is extension-only, hence unowned
+      this.handleCaptureEvent(msg, sender.owner) // HTTP senders are extensions, hence unowned
       return
     }
+    if (isResult(msg)) this.handleResult(msg, sender)
+  }
 
-    if (!isResult(msg)) return
+  /** The HTTP registration holding this token, if any. */
+  private httpBrowserByToken(token: string): ConnectedBrowser | undefined {
+    return this.registry.all().find((b) => b.transport === 'http' && b.httpToken !== undefined && tokensEqual(b.httpToken, token))
+  }
 
-    const handler = this.httpResultHandlers.get(msg.id)
-    if (handler) {
-      this.httpResultHandlers.delete(msg.id)
-      handler(msg)
-      return
-    }
+  /**
+   * The HTTP registration a /result request speaks for: the token's owner, or — only for an
+   * old-build registration that holds no token — the one an extension-scheme Origin vouches for.
+   */
+  private httpSender(req: Request): ConnectedBrowser | undefined {
+    const token = req.headers.get(HTTP_TOKEN_HEADER)
+    if (token) return this.httpBrowserByToken(token)
+    if (!isExtensionOrigin(req.headers.get('origin'))) return undefined
+    return this.registry.all().find((b) => b.transport === 'http' && b.originAuth)
+  }
 
-    // Fall through to the shared pending map (resolves/rejects the dispatch promise)
-    const pending = this.pending.get(msg.id)
-    if (!pending) return
+  private httpAuthorized(ext: ConnectedBrowser, req: Request): boolean {
+    const token = req.headers.get(HTTP_TOKEN_HEADER)
+    if (token) return ext.httpToken !== undefined && tokensEqual(ext.httpToken, token)
+    return ext.originAuth === true && isExtensionOrigin(req.headers.get('origin'))
+  }
 
-    clearTimeout(pending.timeoutHandle)
-    this.pending.delete(msg.id)
-
-    if (msg.success) {
-      pending.resolve(msg.data)
-    } else {
-      pending.reject(new Error(msg.error ?? 'Command failed'))
-    }
+  /** Whether a registration still holds its name: a socket is live while open; an HTTP one while it keeps polling or has a command out. */
+  private isLive(b: ConnectedBrowser): boolean {
+    if (b.transport === 'ws') return true
+    for (const p of this.pending.values()) if (p.browserId === b.id) return true
+    return Date.now() - (b.lastSeen ?? b.connectedAt) < this.httpLiveMs
   }
 
   // ─── Connections ─────────────────────────────────────────────────────────
@@ -567,10 +635,12 @@ export class WebsterServer {
     // This prevents test clients or stray connections from hijacking the slot.
     // A socket that never registers is closed after a short bound.
     const timer = setTimeout(() => {
+      this.handshakeTimers.delete(ws)
       if (this.registry.findByWs(ws)) return
       try { (ws as { close(code?: number, reason?: string): void }).close(1008, 'handshake timeout') } catch { /* already closed */ }
     }, this.handshakeTimeoutMs)
     timer.unref?.()
+    this.handshakeTimers.set(ws, timer)
   }
 
   private handleMessage(ws: unknown, data: string | Buffer) {
@@ -749,6 +819,8 @@ export class WebsterServer {
   }
 
   private handleClose(ws: unknown) {
+    clearTimeout(this.handshakeTimers.get(ws))
+    this.handshakeTimers.delete(ws)
     const ext = this.registry.findByWs(ws)
     if (!ext) return
 
@@ -770,7 +842,6 @@ export class WebsterServer {
     return new Promise((resolve, reject) => {
       const timeoutHandle = setTimeout(() => {
         this.pending.delete(id)
-        this.httpResultHandlers.delete(id)
         reject(new Error(`Command timed out after ${Math.round(timeout / 1000)}s`))
       }, timeout)
 
