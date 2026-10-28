@@ -446,7 +446,7 @@ function handleDebuggerEvent(source, method, params) {
         payloadEncoding: opcode === 2 ? 'base64' : 'utf8',
         payload,
         payloadTruncated: truncated || undefined,
-        timestamp: cdpTimestampToEpochMs(timestamp),
+        timestamp: cdpTimestampToEpochMs(params.timestamp),
       },
     })
     return
@@ -461,7 +461,7 @@ function handleDebuggerEvent(source, method, params) {
         tabId,
         requestId: params.requestId,
         errorMessage: params.errorMessage || '',
-        timestamp: cdpTimestampToEpochMs(timestamp),
+        timestamp: cdpTimestampToEpochMs(params.timestamp),
       },
     })
     return
@@ -475,7 +475,7 @@ function handleDebuggerEvent(source, method, params) {
         subKind: 'close',
         tabId,
         requestId: params.requestId,
-        timestamp: cdpTimestampToEpochMs(timestamp),
+        timestamp: cdpTimestampToEpochMs(params.timestamp),
       },
     })
     return

@@ -209,3 +209,71 @@ describe('capture request bodies for POSTs', () => {
     })
   })
 })
+
+/**
+ * Bug: the Network.webSocketFrameSent/Received/Error/Closed handlers read a bare
+ * `timestamp` that is never declared in handleDebuggerEvent's scope (the other
+ * handlers each destructure their own inside their own block). Each threw a
+ * ReferenceError while building the event, so the event was dropped silently:
+ * a capture recorded the socket's `open` (which uses Date.now()) and nothing
+ * else. Found while capturing a real-world WebSocket-driven web app.
+ *
+ * Shares this file's harness because bun caches command-handlers.js per
+ * process, so a second file could not re-mock pushToServer.
+ */
+describe('capture WebSocket frames', () => {
+  const source = { tabId: 7 }
+  const wsEvents = () => pushed.filter(m => m.type === 'capture_event' && m.kind === 'websocket').map(m => m.data)
+
+  async function startCapture() {
+    await executeCommand({ action: 'startCapture' } as any)
+  }
+
+  test('records a received text frame', async () => {
+    await startCapture()
+    onEvent!(source, 'Network.webSocketFrameReceived', {
+      requestId: 'ws-1', timestamp: 200,
+      response: { opcode: 1, mask: false, payloadData: '[39,{"class":"cmdEcho"}]' },
+    })
+    const [ev] = wsEvents()
+    expect(ev.subKind).toBe('frame')
+    expect(ev.direction).toBe('receive')
+    expect(ev.opcode).toBe(1)
+    expect(ev.payloadEncoding).toBe('utf8')
+    expect(ev.payload).toBe('[39,{"class":"cmdEcho"}]')
+    expect(ev.requestId).toBe('ws-1')
+    expect(ev.tabId).toBe(7)
+    expect(typeof ev.timestamp).toBe('number')
+  })
+
+  test('records a sent frame with direction "send"', async () => {
+    await startCapture()
+    onEvent!(source, 'Network.webSocketFrameSent', {
+      requestId: 'ws-1', timestamp: 200,
+      response: { opcode: 1, mask: true, payloadData: '[40,[{"class":"cmdEcho"}]]' },
+    })
+    const [ev] = wsEvents()
+    expect(ev.direction).toBe('send')
+    expect(ev.mask).toBe(true)
+  })
+
+  test('marks a binary frame (opcode 2) as base64', async () => {
+    await startCapture()
+    onEvent!(source, 'Network.webSocketFrameReceived', {
+      requestId: 'ws-1', timestamp: 200,
+      response: { opcode: 2, mask: false, payloadData: Buffer.from([1, 2, 3]).toString('base64') },
+    })
+    const [ev] = wsEvents()
+    expect(ev.opcode).toBe(2)
+    expect(ev.payloadEncoding).toBe('base64')
+  })
+
+  test('records frame errors and the socket closing', async () => {
+    await startCapture()
+    onEvent!(source, 'Network.webSocketFrameError', { requestId: 'ws-1', timestamp: 201, errorMessage: 'bad frame' })
+    onEvent!(source, 'Network.webSocketClosed', { requestId: 'ws-1', timestamp: 202 })
+    const evs = wsEvents()
+    expect(evs.map(e => e.subKind)).toEqual(['error', 'close'])
+    expect(evs[0].errorMessage).toBe('bad frame')
+  })
+})
