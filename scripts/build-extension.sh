@@ -225,12 +225,23 @@ run_safari() {
   # Running from DerivedData accumulates duplicate pluginkit entries (same bundle ID,
   # different paths) which causes Safari to silently refuse to load the extension.
   local INSTALL_PATH="$HOME/Applications/Webster.app"
+  local APP_BIN="$INSTALL_PATH/Contents/MacOS/Webster"
   mkdir -p "$HOME/Applications"
 
+  # Record launchd state BEFORE touching anything: only a job that is loaded now
+  # is ever stopped and bootstrapped again by this run.
+  local LAUNCHD_PLIST LAUNCHD_LABEL=""
+  LAUNCHD_PLIST=$(find_launchd_plist "$APP_BIN")
+  if [ -n "$LAUNCHD_PLIST" ]; then
+    LAUNCHD_LABEL=$(plutil -extract Label raw -o - "$LAUNCHD_PLIST" 2>/dev/null || true)
+    if [ -z "$LAUNCHD_LABEL" ]; then
+      echo "  ✗ Cannot read Label from $LAUNCHD_PLIST — fix the plist or unload it: launchctl bootout gui/$(id -u) \"$LAUNCHD_PLIST\"" >&2
+      return 1
+    fi
+  fi
+
   echo "  Stopping running Webster.app + its server..."
-  local LAUNCHD_PLIST
-  LAUNCHD_PLIST=$(find_launchd_plist "$INSTALL_PATH")
-  stop_webster "$INSTALL_PATH" "$LAUNCHD_PLIST" || return 1
+  stop_webster "$APP_BIN" "$LAUNCHD_LABEL" || return 1
 
   echo "  Installing to ~/Applications/Webster.app..."
   rm -rf "$INSTALL_PATH"
@@ -239,13 +250,15 @@ run_safari() {
   # Drop the DerivedData registration and register the installed extension
   # explicitly, so pluginkit has exactly one Webster extension.
   pluginkit -r "$APPEX" 2>/dev/null || true
-  pluginkit -a "$INSTALL_PATH/Contents/PlugIns/Webster Extension.appex" 2>/dev/null || true
+  if ! pluginkit -a "$INSTALL_PATH/Contents/PlugIns/Webster Extension.appex" 2>/dev/null; then
+    echo "  ⚠ pluginkit -a failed — Safari may not list the extension; try: pluginkit -a \"$INSTALL_PATH/Contents/PlugIns/Webster Extension.appex\"" >&2
+  fi
 
   if [ -n "$LAUNCHD_PLIST" ]; then
     # launchd (KeepAlive) owns the app: restart through it, with the plist's
     # WEBSTER_PROJECT_DIR / WEBSTER_BUN_PATH, so it isn't launched twice.
-    launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST"
-    echo "  Started via launchd ($LAUNCHD_PLIST)"
+    start_via_launchd "$LAUNCHD_PLIST" "$LAUNCHD_LABEL" || return 1
+    echo "  Started via launchd ($LAUNCHD_LABEL)"
   else
     # Webster.app only starts its server when WEBSTER_PROJECT_DIR is set; `open`
     # does not inherit our environment, so pass it explicitly.
@@ -255,74 +268,178 @@ run_safari() {
   echo "  Safari: Settings > Extensions > enable Webster (Develop > Allow Unsigned Extensions if needed)"
 }
 
-# Print the launchd LaunchAgent plist that runs the given Webster.app, if any.
+# Print the LaunchAgent plist that runs the given app binary and is currently
+# loaded in launchd. A plist that merely exists (or is a *.bak* copy) is
+# ignored, so we never bootstrap a job the user had not loaded.
 find_launchd_plist() {
-  local app_bin="$1/Contents/MacOS/Webster" plist
+  local app_bin="$1" plist first label
   for plist in "$HOME"/Library/LaunchAgents/*.plist; do
     [ -f "$plist" ] || continue
-    if grep -qF "$app_bin" "$plist" 2>/dev/null; then
+    case "$plist" in *.bak*) continue ;; esac
+    first=$(plutil -extract ProgramArguments.0 raw -o - "$plist" 2>/dev/null || true)
+    [ "$first" = "$app_bin" ] || continue
+    label=$(plutil -extract Label raw -o - "$plist" 2>/dev/null || true)
+    [ -n "$label" ] || continue
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
       echo "$plist"
       return 0
     fi
   done
+  return 0
+}
+
+# Bootstrap the job; retry once, then kickstart it. Every failure path says what
+# happened and what to run — nothing exits silently under `set -e`.
+start_via_launchd() {
+  local plist="$1" label="$2" domain
+  domain="gui/$(id -u)"
+  if launchctl bootstrap "$domain" "$plist"; then
+    return 0
+  fi
+  if launchctl print-disabled "$domain" 2>/dev/null | grep -Eq "\"$label\"[[:space:]]*=>[[:space:]]*(disabled|true)"; then
+    echo "  ✗ launchd job $label is disabled, so it cannot be started." >&2
+    echo "    Run: launchctl enable $domain/$label && launchctl bootstrap $domain \"$plist\"" >&2
+    return 1
+  fi
+  echo "  ⚠ launchctl bootstrap failed — retrying once..." >&2
+  sleep 1
+  if launchctl bootstrap "$domain" "$plist"; then
+    return 0
+  fi
+  echo "  ⚠ bootstrap failed again — trying launchctl kickstart -k $domain/$label" >&2
+  if launchctl kickstart -k "$domain/$label"; then
+    return 0
+  fi
+  echo "  ✗ Could not start launchd job $label. The new build is installed but not running." >&2
+  echo "    Run: launchctl bootstrap $domain \"$plist\"   (or: open \"$HOME/Applications/Webster.app\")" >&2
+  return 1
+}
+
+# Print the pids whose executable is exactly the given app binary (exact string
+# comparison on the process's path — no regex, so odd characters in the path
+# are harmless).
+app_pids_for() {
+  local app_bin="$1" pid comm
+  ps -axo pid=,comm= | while read -r pid comm; do
+    [ "$comm" = "$app_bin" ] && echo "$pid"
+  done
+  return 0
+}
+
+# True if pid is a bun server started from THIS checkout: argv ends in
+# src/index.ts and that path resolves to $ROOT/src/index.ts (absolute argv, or
+# relative argv with the process cwd being $ROOT).
+is_this_checkouts_server() {
+  local pid="$1" cmd cwd root_real
+  root_real=$(cd "$ROOT" && pwd -P)
+  cmd=$(ps -o command= -p "$pid" 2>/dev/null || true)
+  case "$cmd" in *bun*) ;; *) return 1 ;; esac
+  case "$cmd" in
+    *" /"*"src/index.ts")
+      [[ "$cmd" == *" $ROOT/src/index.ts" || "$cmd" == *" $root_real/src/index.ts" ]]
+      ;;
+    *" src/index.ts")
+      cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)
+      [ "$cwd" = "$ROOT" ] || [ "$cwd" = "$root_real" ]
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 # Stop the installed Webster.app and the bun server it spawned. Only processes
-# we can tie to the app (its pids, its children, or the Webster server holding
-# the port) are signalled, always by exact pid.
+# we can tie to the app (its pids, its children, or this checkout's Webster
+# server holding the port) are signalled, always by exact pid.
+#
+# Stopping the server ends every MCP session on it, so other Claude sessions
+# using webster must reconnect. The port is $WEBSTER_PORT (default 3456); it must
+# be *exported* for this script to see it.
 stop_webster() {
-  local app="$1" plist="$2" app_bin="$1/Contents/MacOS/Webster"
-  local port="${WEBSTER_PORT:-3456}"
+  local app_bin="$1" label="$2"
+  local port="${WEBSTER_PORT:-3456}" domain
+  domain="gui/$(id -u)"
+
+  # Shared-server notice: this restarts the server other sessions may be using.
+  local status sessions
+  status=$(curl -s --max-time 2 "http://localhost:$port/api/status" 2>/dev/null || true)
+  if [ -n "$status" ]; then
+    sessions=$(printf '%s' "$status" | sed -n 's/.*"sessionCount":\([0-9][0-9]*\).*/\1/p')
+    echo "  Note: restarting the Webster server on :$port ends all MCP sessions on it — other Claude sessions using webster must reconnect."
+    if [ -n "$sessions" ] && [ "$sessions" -gt 0 ]; then
+      echo "  ⚠ $sessions active MCP session(s) will be disconnected."
+    fi
+  fi
 
   # Remember the app's server child(ren) before the app goes away.
-  local app_pids child_pids=""
-  app_pids=$(pgrep -f "^$app_bin" || true)
-  local pid
+  local app_pids child_pids="" pid
+  app_pids=$(app_pids_for "$app_bin")
   for pid in $app_pids; do
     child_pids="$child_pids $(pgrep -P "$pid" || true)"
   done
 
-  if [ -n "$plist" ]; then
+  if [ -n "$label" ]; then
     # bootout stops the job and everything in its process group (the server too).
-    launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+    launchctl bootout "$domain/$label" 2>/dev/null || true
+    # Installing while launchd still has the job registered makes bootstrap fail.
+    local tries=100
+    while launchctl print "$domain/$label" >/dev/null 2>&1; do
+      tries=$(( tries - 1 ))
+      if [ "$tries" -le 0 ]; then
+        echo "  ✗ launchd job $label is still loaded 10s after bootout. Run: launchctl bootout $domain/$label" >&2
+        return 1
+      fi
+      sleep 0.1
+    done
   elif [ -n "$app_pids" ]; then
     osascript -e 'tell application id "com.hammer.webster" to quit' >/dev/null 2>&1 || true
   fi
-  wait_gone "$app_pids $child_pids" 5
 
-  # Escalate for anything still alive.
-  local still=""
-  for pid in $app_pids $child_pids; do
-    kill -0 "$pid" 2>/dev/null && still="$still $pid"
-  done
-  if [ -n "$still" ]; then
+  # Escalate for anything still alive: SIGTERM, then SIGKILL, by exact pid.
+  if ! wait_gone "$app_pids $child_pids" 5; then
+    local still=""
+    for pid in $app_pids $child_pids; do
+      kill -0 "$pid" 2>/dev/null && still="$still $pid"
+    done
     # shellcheck disable=SC2086
     kill $still 2>/dev/null || true
-    wait_gone "$still" 5
-    for pid in $still; do kill -9 "$pid" 2>/dev/null || true; done
+    if ! wait_gone "$still" 5; then
+      for pid in $still; do kill -9 "$pid" 2>/dev/null || true; done
+      if ! wait_gone "$still" 5; then
+        echo "  ✗ Could not stop Webster process(es):$still — kill them manually." >&2
+        return 1
+      fi
+    fi
   fi
 
   # An orphaned Webster server from an older app still holds the port and
-  # would make the new app's server fail to bind.
+  # would make the new app's server fail to bind. Only the first listener is
+  # considered: the server binds one port, and any other holder is not ours to
+  # touch anyway.
   local holder cmd
   holder=$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)
   if [ -n "$holder" ]; then
     cmd=$(ps -o command= -p "$holder" 2>/dev/null || true)
-    case "$cmd" in
-      *bun*src/index.ts*)
-        echo "  Stopping orphaned Webster server (pid $holder) on :$port"
-        kill "$holder" 2>/dev/null || true
-        wait_gone "$holder" 5
-        ;;
-      *)
-        echo "  ✗ Port $port is held by something that is not a Webster server (pid $holder: $cmd)" >&2
-        return 1
-        ;;
-    esac
+    if ! is_this_checkouts_server "$holder"; then
+      echo "  ✗ Port $port is held by pid $holder, which is not this checkout's Webster server ($ROOT): $cmd — stop it yourself (kill $holder) or run this script from its checkout." >&2
+      return 1
+    fi
+    echo "  Stopping orphaned Webster server (pid $holder) on :$port"
+    kill "$holder" 2>/dev/null || true
+    if ! wait_gone "$holder" 5; then
+      # Re-verify before SIGKILL so a recycled pid is never hit.
+      if is_this_checkouts_server "$holder"; then
+        kill -9 "$holder" 2>/dev/null || true
+        wait_gone "$holder" 5 || true
+      fi
+    fi
+    if [ -n "$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)" ]; then
+      echo "  ✗ Port $port is still held after stopping pid $holder. Check: lsof -i tcp:$port" >&2
+      return 1
+    fi
   fi
 }
 
 # wait_gone "<pids>" <seconds> — wait until none of the pids is alive.
+# Returns non-zero if any is still alive when the time is up.
 wait_gone() {
   local pids="$1" tries=$(( $2 * 10 )) pid alive
   while [ "$tries" -gt 0 ]; do
@@ -334,7 +451,7 @@ wait_gone() {
     sleep 0.1
     tries=$(( tries - 1 ))
   done
-  return 0
+  return 1
 }
 
 zip_builds() {

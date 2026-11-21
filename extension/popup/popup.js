@@ -36,8 +36,9 @@ function renderServers(connections, primaryPort, extraPorts) {
   serversList.querySelectorAll('.remove-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const port = Number(btn.dataset.port)
-      chrome.runtime.sendMessage({ type: 'REMOVE_SERVER', port }, () => {
+      chrome.runtime.sendMessage({ type: 'REMOVE_SERVER', port }, (response) => {
         if (chrome.runtime.lastError) { /* ignore */ }
+        else showRejection(response)
       })
     })
   })
@@ -57,6 +58,15 @@ function renderServers(connections, primaryPort, extraPorts) {
       }, 500)
     })
   })
+}
+
+// Safari supports a single port: its SW answers ADD_SERVER/REMOVE_SERVER with
+// { ok: false, error } — show that instead of silently doing nothing.
+function showRejection(response) {
+  if (response && response.ok === false && response.error) {
+    errorEl.textContent = response.error
+    errorEl.hidden = false
+  }
 }
 
 function updateUI() {
@@ -85,8 +95,9 @@ function updateUI() {
 addBtn.addEventListener('click', () => {
   const port = Number(addPortEl.value)
   if (port > 0 && port < 65536) {
-    chrome.runtime.sendMessage({ type: 'ADD_SERVER', port }, () => {
+    chrome.runtime.sendMessage({ type: 'ADD_SERVER', port }, (response) => {
       if (chrome.runtime.lastError) { /* ignore */ }
+      else showRejection(response)
     })
     addPortEl.value = ''
   }

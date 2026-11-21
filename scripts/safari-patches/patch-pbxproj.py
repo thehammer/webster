@@ -62,22 +62,31 @@ def disable_sandbox_in_app_target(text):
     """Set ENABLE_APP_SANDBOX = NO in the app target's build configs only.
 
     The app target configs contain ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES
-    (the extension's do not), so use it as a sentinel and flip the closest
-    preceding ENABLE_APP_SANDBOX = YES. The extension keeps its sandbox.
+    (the extension's do not), so use it as a sentinel to pick them out. The
+    extension keeps its sandbox. Raises PatchError if there are no app configs
+    or one has no ENABLE_APP_SANDBOX to flip (already NO is accepted): a
+    sandboxed app cannot spawn the bun server.
     """
     sentinel = "ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;"
     flag_yes, flag_no = "ENABLE_APP_SANDBOX = YES;", "ENABLE_APP_SANDBOX = NO;"
-    parts = text.split(sentinel)
-    if len(parts) < 2:
+    app_configs = 0
+
+    def flip(match):
+        nonlocal app_configs
+        block = match.group(0)
+        if sentinel not in block:
+            return block
+        app_configs += 1
+        if flag_yes in block:
+            return block.replace(flag_yes, flag_no)
+        if flag_no in block:
+            return block
+        raise PatchError("ENABLE_APP_SANDBOX not found in an app target build config")
+
+    patched = re.sub(r"isa = XCBuildConfiguration;.*?\n\t\t\};", flip, text, flags=re.S)
+    if app_configs == 0:
         raise PatchError("app target build configs not found (no ENABLE_OUTGOING_NETWORK_CONNECTIONS)")
-    result = []
-    for part in parts[:-1]:
-        idx = part.rfind(flag_yes)
-        if idx != -1:
-            part = part[:idx] + flag_no + part[idx + len(flag_yes):]
-        result.append(part)
-    result.append(parts[-1])
-    return sentinel.join(result)
+    return patched
 
 
 def patch(content):
@@ -138,6 +147,11 @@ def patch(content):
     #    implicitly @MainActor; StatusBarController uses explicit @MainActor.
     #    The setting only appears in the app target configs.
     content = re.sub(r'[ \t]*SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;\n', "", content)
+    # The setting is optional (Xcodes before 26 do not emit it), but if it is
+    # still there set to MainActor in a form we did not strip, the build would
+    # fail later in Carbon's callback — fail here instead.
+    if re.search(r'SWIFT_DEFAULT_ACTOR_ISOLATION\s*=\s*"?MainActor"?\s*;', content):
+        raise PatchError("SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor present but could not be removed")
 
     return content
 
