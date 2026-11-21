@@ -132,6 +132,8 @@ Build for your browser(s):
 ```
 `--run` converts the extension to an Xcode project, builds it, quits the installed Webster.app and its server (through launchd if you have a LaunchAgent for it, otherwise directly), installs the new build to `~/Applications/Webster.app` and starts it. Without `--run`, `--safari --xcode` generates and patches the project and opens it in Xcode.
 
+`--run` restarts the shared server, which **ends every MCP session on it**: other Claude sessions using webster must reconnect. The script prints a notice (with the active session count) before stopping it. It only stops the app launchd already has loaded, the app's own processes, and a leftover server started from *this* checkout; any other process holding the port makes it stop with an error. To make it honour a non-default port, **export** `WEBSTER_PORT` (a plain shell variable is not seen by the script).
+
 Verified on Xcode 27.2; older Xcodes that already emit `project.pbxproj` take the unchanged path. Xcode 27's `safari-web-extension-converter` writes `project.xcproj` instead of `project.pbxproj`; the build converts it back with `xcodebuild -convert-project pbxproj` before patching, and fails with a clear message if neither file exists.
 
 The one manual step: **Safari → Settings → Extensions → enable Webster** (if Safari doesn't list it, turn on **Develop → Allow Unsigned Extensions** first; the build is ad-hoc signed). Once enabled, `curl localhost:3456/api/status` lists a `safari` extension and the extension popup shows a **Connected** row for port 3456.

@@ -298,6 +298,46 @@ class PatchFailureTests(unittest.TestCase):
                     fixture.replace("ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;", "SOMETHING_ELSE = YES;")
                 )
 
+    def test_app_config_without_app_sandbox_setting_raises(self):
+        for label, fixture in FIXTURES.items():
+            with self.subTest(fixture=label):
+                # Rename the flag in the app configs only (the extension's stays).
+                broken = fixture.replace(
+                    "ENABLE_APP_SANDBOX = YES;\n\t\t\t\tENABLE_OUTGOING_NETWORK_CONNECTIONS",
+                    "OTHER_FLAG = YES;\n\t\t\t\tENABLE_OUTGOING_NETWORK_CONNECTIONS",
+                )
+                self.assertNotEqual(broken, fixture)
+                self.assert_raises_for(broken)
+
+    def test_app_sandbox_already_off_in_app_configs_is_accepted(self):
+        for label, fixture in FIXTURES.items():
+            with self.subTest(fixture=label):
+                already = fixture.replace(
+                    "ENABLE_APP_SANDBOX = YES;\n\t\t\t\tENABLE_OUTGOING_NETWORK_CONNECTIONS",
+                    "ENABLE_APP_SANDBOX = NO;\n\t\t\t\tENABLE_OUTGOING_NETWORK_CONNECTIONS",
+                )
+                out = pp.patch(already)
+                for block in app_blocks(out):
+                    self.assertIn("ENABLE_APP_SANDBOX = NO;", block)
+
+    def test_unstrippable_main_actor_default_isolation_raises(self):
+        for label, fixture in FIXTURES.items():
+            with self.subTest(fixture=label):
+                broken = fixture.replace(
+                    "SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;",
+                    'SWIFT_DEFAULT_ACTOR_ISOLATION = "MainActor";',
+                )
+                self.assertNotEqual(broken, fixture)
+                self.assert_raises_for(broken)
+
+    def test_absent_default_actor_isolation_is_fine(self):
+        # Xcodes before 26 do not emit the setting at all.
+        for label, fixture in FIXTURES.items():
+            with self.subTest(fixture=label):
+                bare = fixture.replace("\t\t\t\tSWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;\n", "")
+                self.assertNotEqual(bare, fixture)
+                self.assertNotIn("SWIFT_DEFAULT_ACTOR_ISOLATION", pp.patch(bare))
+
     def test_missing_file_reference_section_raises(self):
         for label, fixture in FIXTURES.items():
             with self.subTest(fixture=label):
