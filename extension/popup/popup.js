@@ -78,7 +78,7 @@ function updateUI() {
       return
     }
     errorEl.hidden = true
-    renderServers(response.connections, response.primaryPort, response.extraPorts)
+    renderServers(response.connections || {}, response.primaryPort || 3456, response.extraPorts || [])
   })
 }
 
