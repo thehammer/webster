@@ -5,3 +5,4 @@ dist/
 build/
 .DS_Store
 .claude/SESSION_NOTES.md
+__pycache__/

@@ -117,7 +117,7 @@ with open('$OUT/manifest.json', 'w') as f:
   if [ "$XCODE" = true ]; then
     if ! command -v xcrun &>/dev/null; then
       echo "  ✗ xcrun not found — install Xcode to build the Safari app"
-      return
+      return 1
     fi
     local XCODE_OUT="$BUILD/safari-xcode"
     rm -rf "$XCODE_OUT"
@@ -128,10 +128,23 @@ with open('$OUT/manifest.json', 'w') as f:
       --bundle-identifier com.hammer.webster \
       --swift --no-open --macos-only 2>&1
 
-    # Fix bundle ID capitalization mismatch (converter uses capital W for app)
-    sed -i '' \
-      's/PRODUCT_BUNDLE_IDENTIFIER = com\.hammer\.Webster;/PRODUCT_BUNDLE_IDENTIFIER = com.hammer.webster;/g' \
-      "$XCODE_OUT/Webster/Webster.xcodeproj/project.pbxproj"
+    # Xcode 27's converter writes project.xcproj (a JSON-like description) instead
+    # of project.pbxproj. xcodebuild can convert it back to the classic format,
+    # which is what patch-pbxproj.py edits. Older Xcodes already emit pbxproj.
+    local XCODEPROJ="$XCODE_OUT/Webster/Webster.xcodeproj"
+    local PBXPROJ="$XCODEPROJ/project.pbxproj"
+    if [ ! -f "$PBXPROJ" ] && [ -f "$XCODEPROJ/project.xcproj" ]; then
+      echo "  Xcode 27 project format (project.xcproj) — converting to pbxproj..."
+      if ! xcodebuild -project "$XCODEPROJ" -convert-project pbxproj >/dev/null 2>&1; then
+        echo "  ✗ xcodebuild -convert-project pbxproj failed on $XCODEPROJ" >&2
+        return 1
+      fi
+    fi
+    if [ ! -f "$PBXPROJ" ]; then
+      echo "  ✗ Converter produced neither project.pbxproj nor project.xcproj in $XCODEPROJ" >&2
+      ls -la "$XCODEPROJ" >&2 || true
+      return 1
+    fi
 
     # Apply patches: full menu bar app + bun server management
     local PATCHES="$SCRIPT_DIR/safari-patches"
@@ -142,8 +155,8 @@ with open('$OUT/manifest.json', 'w') as f:
     cp "$PATCHES/Info.plist"                "$XCODE_OUT/Webster/Webster/Info.plist"
     cp "$ROOT/menubar/Resources/icon-template.png" "$XCODE_OUT/Webster/Webster/icon-template.png"
 
-    # Wire new files into the Xcode project + Carbon framework + disable sandbox
-    python3 "$PATCHES/patch-pbxproj.py" "$XCODE_OUT/Webster/Webster.xcodeproj/project.pbxproj"
+    # Fix bundle id case, wire new files into the project, link Carbon, disable sandbox
+    python3 "$PATCHES/patch-pbxproj.py" "$PBXPROJ" || return 1
     echo "  Patched: menu bar app + bun server management (StatusBarController, WebsterClient, HotkeyManager)"
 
     if [ "$RUN" = false ]; then
@@ -214,18 +227,114 @@ run_safari() {
   local INSTALL_PATH="$HOME/Applications/Webster.app"
   mkdir -p "$HOME/Applications"
 
+  echo "  Stopping running Webster.app + its server..."
+  local LAUNCHD_PLIST
+  LAUNCHD_PLIST=$(find_launchd_plist "$INSTALL_PATH")
+  stop_webster "$INSTALL_PATH" "$LAUNCHD_PLIST" || return 1
+
   echo "  Installing to ~/Applications/Webster.app..."
-  pkill -f "Webster.app/Contents/MacOS/Webster" 2>/dev/null || true
-  sleep 0.3
   rm -rf "$INSTALL_PATH"
   cp -R "$APP_PATH" "$INSTALL_PATH"
 
-  # Remove any stale DerivedData registration from pluginkit
-  local STALE_APPEX="$APP_PATH/Contents/PlugIns/Webster Extension.appex"
-  pluginkit -r "$STALE_APPEX" 2>/dev/null || true
+  # Drop the DerivedData registration and register the installed extension
+  # explicitly, so pluginkit has exactly one Webster extension.
+  pluginkit -r "$APPEX" 2>/dev/null || true
+  pluginkit -a "$INSTALL_PATH/Contents/PlugIns/Webster Extension.appex" 2>/dev/null || true
 
-  open "$INSTALL_PATH"
+  if [ -n "$LAUNCHD_PLIST" ]; then
+    # launchd (KeepAlive) owns the app: restart through it, with the plist's
+    # WEBSTER_PROJECT_DIR / WEBSTER_BUN_PATH, so it isn't launched twice.
+    launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST"
+    echo "  Started via launchd ($LAUNCHD_PLIST)"
+  else
+    # Webster.app only starts its server when WEBSTER_PROJECT_DIR is set; `open`
+    # does not inherit our environment, so pass it explicitly.
+    open --env "WEBSTER_PROJECT_DIR=$ROOT" "$INSTALL_PATH"
+  fi
   echo "✓ Webster running — $INSTALL_PATH"
+  echo "  Safari: Settings > Extensions > enable Webster (Develop > Allow Unsigned Extensions if needed)"
+}
+
+# Print the launchd LaunchAgent plist that runs the given Webster.app, if any.
+find_launchd_plist() {
+  local app_bin="$1/Contents/MacOS/Webster" plist
+  for plist in "$HOME"/Library/LaunchAgents/*.plist; do
+    [ -f "$plist" ] || continue
+    if grep -qF "$app_bin" "$plist" 2>/dev/null; then
+      echo "$plist"
+      return 0
+    fi
+  done
+}
+
+# Stop the installed Webster.app and the bun server it spawned. Only processes
+# we can tie to the app (its pids, its children, or the Webster server holding
+# the port) are signalled, always by exact pid.
+stop_webster() {
+  local app="$1" plist="$2" app_bin="$1/Contents/MacOS/Webster"
+  local port="${WEBSTER_PORT:-3456}"
+
+  # Remember the app's server child(ren) before the app goes away.
+  local app_pids child_pids=""
+  app_pids=$(pgrep -f "^$app_bin" || true)
+  local pid
+  for pid in $app_pids; do
+    child_pids="$child_pids $(pgrep -P "$pid" || true)"
+  done
+
+  if [ -n "$plist" ]; then
+    # bootout stops the job and everything in its process group (the server too).
+    launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+  elif [ -n "$app_pids" ]; then
+    osascript -e 'tell application id "com.hammer.webster" to quit' >/dev/null 2>&1 || true
+  fi
+  wait_gone "$app_pids $child_pids" 5
+
+  # Escalate for anything still alive.
+  local still=""
+  for pid in $app_pids $child_pids; do
+    kill -0 "$pid" 2>/dev/null && still="$still $pid"
+  done
+  if [ -n "$still" ]; then
+    # shellcheck disable=SC2086
+    kill $still 2>/dev/null || true
+    wait_gone "$still" 5
+    for pid in $still; do kill -9 "$pid" 2>/dev/null || true; done
+  fi
+
+  # An orphaned Webster server from an older app still holds the port and
+  # would make the new app's server fail to bind.
+  local holder cmd
+  holder=$(lsof -ti "tcp:$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)
+  if [ -n "$holder" ]; then
+    cmd=$(ps -o command= -p "$holder" 2>/dev/null || true)
+    case "$cmd" in
+      *bun*src/index.ts*)
+        echo "  Stopping orphaned Webster server (pid $holder) on :$port"
+        kill "$holder" 2>/dev/null || true
+        wait_gone "$holder" 5
+        ;;
+      *)
+        echo "  ✗ Port $port is held by something that is not a Webster server (pid $holder: $cmd)" >&2
+        return 1
+        ;;
+    esac
+  fi
+}
+
+# wait_gone "<pids>" <seconds> — wait until none of the pids is alive.
+wait_gone() {
+  local pids="$1" tries=$(( $2 * 10 )) pid alive
+  while [ "$tries" -gt 0 ]; do
+    alive=false
+    for pid in $pids; do
+      kill -0 "$pid" 2>/dev/null && alive=true
+    done
+    [ "$alive" = false ] && return 0
+    sleep 0.1
+    tries=$(( tries - 1 ))
+  done
+  return 0
 }
 
 zip_builds() {

@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
 # patch-pbxproj.py — Adds Webster menu bar source files to the Xcode project.
-# Run after xcrun safari-web-extension-converter to wire in:
+# Run after xcrun safari-web-extension-converter (and, on Xcode 27+, after
+# `xcodebuild -convert-project pbxproj` — see build-extension.sh) to wire in:
 #   StatusBarController.swift, WebsterClient.swift, HotkeyManager.swift,
 #   icon-template.png, Carbon framework, and disables app sandbox.
 #
+# Input must be a classic OpenStep project.pbxproj. Xcode 27's converter emits
+# a different file (project.xcproj, a JSON-like description); build-extension.sh
+# converts it back with xcodebuild before calling this script.
+#
 # Uses deterministic UUIDs so the patch is idempotent across rebuilds.
+# Fails loudly (PatchError, exit 1) if an expected anchor is missing, rather
+# than writing a project that silently lacks the menu bar sources.
 
 import re, sys
 
-PBXPROJ = sys.argv[1]
-with open(PBXPROJ) as f:
-    content = f.read()
+MARKER = "AABBCC001122334455660001"
 
-# Skip if already patched
-if "AABBCC001122334455660001" in content:
-    print("  pbxproj already patched — skipping")
-    sys.exit(0)
-
-# ---------------------------------------------------------------------------
-# Deterministic UUIDs for our new entries
-# ---------------------------------------------------------------------------
 FR = {  # PBXFileReference IDs
     "StatusBarController.swift": "AABBCC001122334455660001",
     "WebsterClient.swift":       "AABBCC001122334455660002",
@@ -32,141 +29,139 @@ BF = {  # PBXBuildFile IDs
     "HotkeyManager.swift":       "AABBCC001122334455660013",
     "icon-template.png":         "AABBCC001122334455660014",
 }
+SWIFT_FILES = ["StatusBarController.swift", "WebsterClient.swift", "HotkeyManager.swift"]
 
-# ---------------------------------------------------------------------------
-# 1. PBXBuildFile entries
-# ---------------------------------------------------------------------------
-new_buildfiles = (
-    f'\t\t{BF["StatusBarController.swift"]} /* StatusBarController.swift in Sources */ = '
-    f'{{isa = PBXBuildFile; fileRef = {FR["StatusBarController.swift"]} /* StatusBarController.swift */; }};\n'
-    f'\t\t{BF["WebsterClient.swift"]} /* WebsterClient.swift in Sources */ = '
-    f'{{isa = PBXBuildFile; fileRef = {FR["WebsterClient.swift"]} /* WebsterClient.swift */; }};\n'
-    f'\t\t{BF["HotkeyManager.swift"]} /* HotkeyManager.swift in Sources */ = '
-    f'{{isa = PBXBuildFile; fileRef = {FR["HotkeyManager.swift"]} /* HotkeyManager.swift */; }};\n'
-    f'\t\t{BF["icon-template.png"]} /* icon-template.png in Resources */ = '
-    f'{{isa = PBXBuildFile; fileRef = {FR["icon-template.png"]} /* icon-template.png */; }};\n'
-)
-content = content.replace(
-    "/* End PBXBuildFile section */",
-    new_buildfiles + "/* End PBXBuildFile section */"
-)
 
-# ---------------------------------------------------------------------------
-# 2. PBXFileReference entries
-# ---------------------------------------------------------------------------
-new_filerefs = (
-    f'\t\t{FR["StatusBarController.swift"]} /* StatusBarController.swift */ = '
-    f'{{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusBarController.swift; sourceTree = "<group>"; }};\n'
-    f'\t\t{FR["WebsterClient.swift"]} /* WebsterClient.swift */ = '
-    f'{{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebsterClient.swift; sourceTree = "<group>"; }};\n'
-    f'\t\t{FR["HotkeyManager.swift"]} /* HotkeyManager.swift */ = '
-    f'{{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotkeyManager.swift; sourceTree = "<group>"; }};\n'
-    f'\t\t{FR["icon-template.png"]} /* icon-template.png */ = '
-    f'{{isa = PBXFileReference; lastKnownFileType = image.png; path = "icon-template.png"; sourceTree = "<group>"; }};\n'
-)
-content = content.replace(
-    "/* End PBXFileReference section */",
-    new_filerefs + "/* End PBXFileReference section */"
-)
+class PatchError(Exception):
+    pass
 
-# ---------------------------------------------------------------------------
-# 3. Add file refs to the Webster group (anchored on ViewController.swift)
-# ---------------------------------------------------------------------------
-new_group_entries = (
-    f'\t\t\t\t{FR["StatusBarController.swift"]} /* StatusBarController.swift */,\n'
-    f'\t\t\t\t{FR["WebsterClient.swift"]} /* WebsterClient.swift */,\n'
-    f'\t\t\t\t{FR["HotkeyManager.swift"]} /* HotkeyManager.swift */,\n'
-    f'\t\t\t\t{FR["icon-template.png"]} /* icon-template.png */,\n'
-)
-# Find ViewController.swift ref line in the group (matches any UUID prefix)
-content = re.sub(
-    r'(\t+\w+ /\* ViewController\.swift \*/,)',
-    r'\1\n' + new_group_entries.rstrip('\n'),
-    content
-)
 
-# ---------------------------------------------------------------------------
-# 4a. Add Swift build files to Webster Sources build phase
-#     (anchored on AppDelegate.swift in Sources)
-# ---------------------------------------------------------------------------
-new_sources = (
-    f'\t\t\t\t{BF["StatusBarController.swift"]} /* StatusBarController.swift in Sources */,\n'
-    f'\t\t\t\t{BF["WebsterClient.swift"]} /* WebsterClient.swift in Sources */,\n'
-    f'\t\t\t\t{BF["HotkeyManager.swift"]} /* HotkeyManager.swift in Sources */,\n'
-)
-content = re.sub(
-    r'(\t+\w+ /\* AppDelegate\.swift in Sources \*/,)',
-    r'\1\n' + new_sources.rstrip('\n'),
-    content
-)
+def _insert_after(content, pattern, new_lines, what):
+    """Insert new_lines after the first line matching pattern; raise if absent."""
+    patched, n = re.subn(pattern, lambda m: m.group(0) + "\n" + new_lines.rstrip("\n"), content, count=1)
+    if n != 1:
+        raise PatchError(f"anchor not found for {what}: {pattern}")
+    return patched
 
-# ---------------------------------------------------------------------------
-# 4b. Add icon to Webster Resources build phase
-#     (anchored on Assets.xcassets in Resources)
-# ---------------------------------------------------------------------------
-new_resources = (
-    f'\t\t\t\t{BF["icon-template.png"]} /* icon-template.png in Resources */,\n'
-)
-content = re.sub(
-    r'(\t+\w+ /\* Assets\.xcassets in Resources \*/,)',
-    r'\1\n' + new_resources.rstrip('\n'),
-    content
-)
 
-# ---------------------------------------------------------------------------
-# 5. Add Carbon framework to OTHER_LDFLAGS (app target only — has WebKit)
-# ---------------------------------------------------------------------------
-content = content.replace(
-    '"-framework",\n\t\t\t\tWebKit,',
-    '"-framework",\n\t\t\t\tWebKit,\n\t\t\t\t"-framework",\n\t\t\t\tCarbon,'
-)
+def _insert_before(content, marker, new_text, what):
+    if marker not in content:
+        raise PatchError(f"anchor not found for {what}: {marker}")
+    return content.replace(marker, new_text + marker, 1)
 
-# ---------------------------------------------------------------------------
-# 6. Disable app sandbox for the Webster app target so it can spawn bun.
-#    Only the two configs that have ENABLE_OUTGOING_NETWORK_CONNECTIONS
-#    (the app target) need this change — the extension target keeps its sandbox.
-# ---------------------------------------------------------------------------
-# The app target configs contain ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES.
-# Replace ENABLE_APP_SANDBOX = YES only in those sections.
+
+def fix_bundle_id(content):
+    """Converter uses capital W for the app's bundle id; Safari needs lowercase."""
+    return content.replace(
+        "PRODUCT_BUNDLE_IDENTIFIER = com.hammer.Webster;",
+        "PRODUCT_BUNDLE_IDENTIFIER = com.hammer.webster;",
+    )
+
+
 def disable_sandbox_in_app_target(text):
-    # Split on the sentinel that only appears in app target configs
+    """Set ENABLE_APP_SANDBOX = NO in the app target's build configs only.
+
+    The app target configs contain ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES
+    (the extension's do not), so use it as a sentinel and flip the closest
+    preceding ENABLE_APP_SANDBOX = YES. The extension keeps its sandbox.
+    """
     sentinel = "ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;"
+    flag_yes, flag_no = "ENABLE_APP_SANDBOX = YES;", "ENABLE_APP_SANDBOX = NO;"
     parts = text.split(sentinel)
+    if len(parts) < 2:
+        raise PatchError("app target build configs not found (no ENABLE_OUTGOING_NETWORK_CONNECTIONS)")
     result = []
-    for i, part in enumerate(parts):
-        if i < len(parts) - 1:
-            # This part precedes a sentinel — replace ENABLE_APP_SANDBOX in it
-            # We only want to replace the one closest to the sentinel
-            replaced = re.sub(
-                r'(ENABLE_APP_SANDBOX = )YES(;)',
-                r'\1NO\2',
-                part,
-                count=1,
-                flags=re.REVERSE if hasattr(re, 'REVERSE') else 0
-            )
-            # re doesn't have REVERSE — do it manually: replace last occurrence
-            idx = part.rfind("ENABLE_APP_SANDBOX = YES;")
-            if idx != -1:
-                part = part[:idx] + "ENABLE_APP_SANDBOX = NO;" + part[idx + len("ENABLE_APP_SANDBOX = YES;"):]
-            result.append(part)
-            result.append(sentinel)
-        else:
-            result.append(part)
-    return "".join(result)
+    for part in parts[:-1]:
+        idx = part.rfind(flag_yes)
+        if idx != -1:
+            part = part[:idx] + flag_no + part[idx + len(flag_yes):]
+        result.append(part)
+    result.append(parts[-1])
+    return sentinel.join(result)
 
-content = disable_sandbox_in_app_target(content)
 
-# ---------------------------------------------------------------------------
-# 7. Remove SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor from the app target.
-#    HotkeyManager's Carbon callback can't be implicitly @MainActor — it's a
-#    C function pointer. StatusBarController uses explicit @MainActor so the
-#    build-level default isn't needed.
-#    This setting only appears in the app target configs (not extension), so a
-#    simple removal is safe.
-# ---------------------------------------------------------------------------
-content = content.replace("\t\t\t\tSWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;\n", "")
+def patch(content):
+    """Return content with the Webster menu bar sources wired in."""
+    if MARKER in content:
+        return content  # already patched
 
-with open(PBXPROJ, 'w') as f:
-    f.write(content)
+    content = fix_bundle_id(content)
 
-print("  Patched pbxproj: StatusBarController + WebsterClient + HotkeyManager + icon + Carbon + no sandbox + no default actor isolation")
+    # 1. PBXBuildFile entries
+    new_buildfiles = "".join(
+        f'\t\t{BF[n]} /* {n} in Sources */ = '
+        f'{{isa = PBXBuildFile; fileRef = {FR[n]} /* {n} */; }};\n'
+        for n in SWIFT_FILES
+    ) + (
+        f'\t\t{BF["icon-template.png"]} /* icon-template.png in Resources */ = '
+        f'{{isa = PBXBuildFile; fileRef = {FR["icon-template.png"]} /* icon-template.png */; }};\n'
+    )
+    content = _insert_before(content, "/* End PBXBuildFile section */", new_buildfiles, "PBXBuildFile section")
+
+    # 2. PBXFileReference entries
+    new_filerefs = "".join(
+        f'\t\t{FR[n]} /* {n} */ = '
+        f'{{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = {n}; sourceTree = "<group>"; }};\n'
+        for n in SWIFT_FILES
+    ) + (
+        f'\t\t{FR["icon-template.png"]} /* icon-template.png */ = '
+        f'{{isa = PBXFileReference; lastKnownFileType = image.png; path = "icon-template.png"; sourceTree = "<group>"; }};\n'
+    )
+    content = _insert_before(content, "/* End PBXFileReference section */", new_filerefs, "PBXFileReference section")
+
+    # 3. Add file refs to the Webster group (anchored on ViewController.swift)
+    group_entries = "".join(f'\t\t\t\t{FR[n]} /* {n} */,\n' for n in SWIFT_FILES + ["icon-template.png"])
+    content = _insert_after(content, r'\t+\w+ /\* ViewController\.swift \*/,', group_entries, "Webster group")
+
+    # 4a. Swift build files into the Sources phase (anchored on AppDelegate.swift)
+    sources = "".join(f'\t\t\t\t{BF[n]} /* {n} in Sources */,\n' for n in SWIFT_FILES)
+    content = _insert_after(content, r'\t+\w+ /\* AppDelegate\.swift in Sources \*/,', sources, "Sources build phase")
+
+    # 4b. Icon into the Resources phase (anchored on Assets.xcassets)
+    resources = f'\t\t\t\t{BF["icon-template.png"]} /* icon-template.png in Resources */,\n'
+    content = _insert_after(content, r'\t+\w+ /\* Assets\.xcassets in Resources \*/,', resources, "Resources build phase")
+
+    # 5. Carbon framework (app target only — it is the one linking WebKit)
+    link_webkit = '"-framework",\n\t\t\t\t\tWebKit,'
+    if link_webkit not in content:
+        raise PatchError("WebKit OTHER_LDFLAGS entry not found (cannot add Carbon)")
+    content = content.replace(
+        link_webkit,
+        link_webkit + '\n\t\t\t\t\t"-framework",\n\t\t\t\t\tCarbon,',
+    )
+
+    # 6. Disable app sandbox for the app target so it can spawn bun.
+    content = disable_sandbox_in_app_target(content)
+
+    # 7. Remove SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor from the app target.
+    #    HotkeyManager's Carbon callback is a C function pointer and can't be
+    #    implicitly @MainActor; StatusBarController uses explicit @MainActor.
+    #    The setting only appears in the app target configs.
+    content = re.sub(r'[ \t]*SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;\n', "", content)
+
+    return content
+
+
+def main(argv):
+    if len(argv) != 2:
+        print("usage: patch-pbxproj.py <path/to/project.pbxproj>", file=sys.stderr)
+        return 2
+    path = argv[1]
+    with open(path) as f:
+        original = f.read()
+    try:
+        patched = patch(original)
+    except PatchError as e:
+        print(f"  ✗ patch-pbxproj: {e}", file=sys.stderr)
+        return 1
+    if patched == original:
+        print("  pbxproj already patched — skipping")
+        return 0
+    with open(path, "w") as f:
+        f.write(patched)
+    print("  Patched pbxproj: StatusBarController + WebsterClient + HotkeyManager + icon + Carbon + no sandbox + no default actor isolation")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
