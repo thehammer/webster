@@ -99,7 +99,7 @@ async function connect() {
     await updateState({ connected: true, port, lastError: null })
   } catch (err) {
     if (lockRelease) { lockRelease(); lockRelease = null }
-    await updateState({ connected: false, lastError: String(err) })
+    await updateState({ connected: false, port, lastError: String(err) })
     scheduleReconnect(port)
     return
   }
@@ -119,7 +119,7 @@ async function pollLoop(port, base) {
         command = await resp.json()
       } catch (err) {
         if (err?.name === 'TimeoutError' || err?.name === 'AbortError') continue // normal timeout, poll again
-        await updateState({ connected: false, lastError: String(err) })
+        await updateState({ connected: false, port, lastError: String(err) })
         polling = false
         scheduleReconnect(port)
         return
@@ -154,9 +154,29 @@ async function pollLoop(port, base) {
 // Handle messages from popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'GET_STATE') {
-    chrome.storage.local.get('websterState').then((r) => {
-      sendResponse(r.websterState || { connected: false, port: DEFAULT_PORT, commandsExecuted: 0, lastError: null })
+    // Same shape the Chrome service worker returns, which is what popup.js renders:
+    // { connections: { [port]: { connected, commandsExecuted, lastError } }, primaryPort, extraPorts }.
+    // Safari talks to a single server, so there is one connection and no extra ports.
+    Promise.all([chrome.storage.local.get('websterState'), getPort()]).then(([r, port]) => {
+      const s = r.websterState || {}
+      const current = s.port === port // state from a previous port says nothing about this one
+      sendResponse({
+        connections: {
+          [port]: {
+            connected: current && !!s.connected,
+            commandsExecuted: s.commandsExecuted || 0,
+            lastError: (current && s.lastError) || null,
+          },
+        },
+        primaryPort: port,
+        extraPorts: [],
+      })
     })
+    return true
+  }
+
+  if (message.type === 'ADD_SERVER' || message.type === 'REMOVE_SERVER') {
+    sendResponse({ ok: false, error: 'Safari supports a single server port' })
     return true
   }
 

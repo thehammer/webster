@@ -222,7 +222,7 @@ cd menubar && swift build && .build/debug/WebsterMenu
 
 - **Chrome/Edge**: straight copy of `extension/`
 - **Firefox**: adds `browser_specific_settings.gecko` to manifest
-- **Safari**: bundles ES modules into a single classic SW (Safari doesn't support `type: module`), then runs `xcrun safari-web-extension-converter`
+- **Safari**: bundles ES modules into a single classic SW (Safari doesn't support `type: module`), then runs `xcrun safari-web-extension-converter`. Xcode 27's converter emits `project.xcproj`; the script converts it with `xcodebuild -convert-project pbxproj` before `scripts/safari-patches/patch-pbxproj.py` runs (tests: `cd scripts/safari-patches && python3 -m unittest`)
 - Build output: `build/extension/{chrome,firefox,safari-src}/`
 - Zips for distribution: `./scripts/build-extension.sh --all --zip`
 
